@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Verify Python sources
+        shell: powershell
+        run: py -m compileall -q apps
+
+      - name: Verify browser JavaScript syntax
+        shell: powershell
+        run: |
+          Get-ChildItem package\web -Recurse -Filter *.js |
+            ForEach-Object {
+              Write-Host "node --check $($_.FullName)"
+              node --check $_.FullName
+            }
+
+      - name: Explain skipped checks
+        shell: powershell
+        run: |
+          Write-Host "Skipping smoke_test.ps1 in CI because it depends on a local official Codex desktop environment."
