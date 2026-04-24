@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <title>Syncodex</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="background-glow background-glow-left"></div>
+    <div class="background-glow background-glow-right"></div>
+
+    <main class="app-shell">
+      <section id="app" class="page page-root"></section>
+    </main>
+
+    <script src="/vendor/markdown-it.js"></script>
+    <script>
+      (function () {
+        function showBootError(message) {
+          const root = document.getElementById("app");
+          if (!root) return;
+          root.innerHTML =
+            '<section style="padding:24px"><div style="border:1px solid rgba(180,35,24,.25);border-radius:12px;background:#fff7f6;color:#b42318;padding:16px 18px;font:14px/1.6 system-ui,sans-serif"><strong style="display:block;margin-bottom:8px">Syncodex 前端加载失败</strong><div style="white-space:pre-wrap;overflow-wrap:anywhere">' +
+            String(message || "Unknown error") +
+            "</div></div></section>";
+        }
+
+        window.addEventListener("error", function (event) {
+          showBootError(event && event.error ? event.error.stack || event.error.message : event.message);
+        });
+
+        window.addEventListener("unhandledrejection", function (event) {
+          const reason = event && event.reason;
+          showBootError(reason && reason.stack ? reason.stack : reason);
+        });
+      })();
+    </script>
+    <script type="module" src="/app.js"></script>
+  </body>
+  </html>
