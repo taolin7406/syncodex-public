@@ -142,8 +142,8 @@ Important properties:
 - the local bridge still listens on `127.0.0.1`
 - public access requires a temporary tokenized URL
 - stopping mobile access or exiting Syncodex invalidates the session
-- during development, `scripts\rebuild_restart_preserve_mobile.ps1` is the preferred
-  rebuild script because it keeps `cloudflared.exe` alive when possible
+- during development, treat the public mobile URL as temporary and expect to refresh it
+  after local rebuilds or restarts unless you preserve the tunnel process yourself
 
 ## Documentation
 
