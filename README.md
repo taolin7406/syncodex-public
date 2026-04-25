@@ -14,6 +14,14 @@ It extends the official desktop experience without replacing the official app:
 The official Codex desktop app remains the source of truth. Syncodex does not run the
 model itself and does not write directly to the official SQLite database.
 
+## Preview
+
+![Syncodex social preview](docs/assets/social-preview.jpg)
+
+Real mobile thread view from the current product UI:
+
+<img src="docs/assets/mobile-thread-view.png" alt="Syncodex mobile thread view" width="360" />
+
 ## Status
 
 Syncodex is currently a Windows-only project built around the official Codex desktop app.
