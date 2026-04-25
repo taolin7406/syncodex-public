@@ -46,8 +46,34 @@ if (-not $hasQrcode) {
 
 $Exe = Join-Path $Dist "Syncodex.exe"
 $LegacyExe = Join-Path $Dist "SyncodexNext.exe"
+
+function Remove-FileWithRetry {
+  param(
+    [Parameter(Mandatory = $true)]
+    [string]$Path,
+    [int]$Attempts = 20,
+    [int]$DelayMs = 300
+  )
+
+  if (-not (Test-Path -LiteralPath $Path)) {
+    return
+  }
+
+  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+    try {
+      Remove-Item -LiteralPath $Path -Force
+      return
+    } catch {
+      if ($attempt -ge $Attempts) {
+        throw
+      }
+      Start-Sleep -Milliseconds $DelayMs
+    }
+  }
+}
+
 if (Test-Path -LiteralPath $Exe) {
-  Remove-Item -LiteralPath $Exe -Force
+  Remove-FileWithRetry -Path $Exe
 }
 
 py -m PyInstaller `

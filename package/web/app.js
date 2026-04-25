@@ -105,6 +105,13 @@ let completionAudioElement = null;
 let lastCompletionAudioError = "";
 let completionAudioUnavailableForCjk = false;
 let messageCopyMenuListenersBound = false;
+const MESSAGE_COPY_TAP_MAX_DURATION_MS = 260;
+const MESSAGE_COPY_TAP_MAX_MOVE_PX = 10;
+const MESSAGE_COPY_TAP_CLICK_WINDOW_MS = 700;
+const MESSAGE_COPY_SELECTION_SUPPRESS_MS = 900;
+let messageCopyTapCandidate = null;
+let pendingMessageCopyTap = null;
+let messageCopySelectionSuppressUntil = 0;
 let composerSendGuard = {
   key: "",
   active: false,
@@ -12982,13 +12989,17 @@ function shouldIgnoreMessageCopyTarget(target) {
   );
 }
 
-function shouldUseTapMessageCopyMenu(event) {
+function isTouchLikeMessageCopySurface() {
   const touchViewport = isMobileWorkspaceViewport();
   const coarsePointer =
     typeof window !== "undefined" &&
     typeof window.matchMedia === "function" &&
     (window.matchMedia("(pointer: coarse)").matches || window.matchMedia("(hover: none)").matches);
-  if (!touchViewport && !coarsePointer) {
+  return touchViewport || coarsePointer;
+}
+
+function shouldUseTapMessageCopyMenu(event) {
+  if (!isTouchLikeMessageCopySurface()) {
     return false;
   }
   if (!(event instanceof Event)) {
@@ -13001,6 +13012,16 @@ function shouldUseTapMessageCopyMenu(event) {
     return true;
   }
   return event.type === "click";
+}
+
+function shouldBypassContextMenuForTouch(event) {
+  if (!isTouchLikeMessageCopySurface()) {
+    return false;
+  }
+  if (typeof PointerEvent !== "undefined" && event instanceof PointerEvent) {
+    return event.pointerType === "touch" || event.pointerType === "pen";
+  }
+  return true;
 }
 
 function getMessageCopyInteractionPoint(event) {
@@ -13059,6 +13080,142 @@ function getMessageCopyKeyFromNode(node) {
   return "";
 }
 
+function getMessageCopyIdentityFromNode(node) {
+  if (!(node instanceof HTMLElement)) {
+    return "";
+  }
+  const key = getMessageCopyKeyFromNode(node);
+  if (key) {
+    return `key:${key}`;
+  }
+  const text = getMessageCopyTextFromNode(node);
+  return text ? `text:${encodeCopyPayload(text).slice(0, 240)}` : "";
+}
+
+function clearMessageCopyTapCandidate() {
+  messageCopyTapCandidate = null;
+}
+
+function clearPendingMessageCopyTap() {
+  pendingMessageCopyTap = null;
+}
+
+function rememberPendingMessageCopyTap(identity) {
+  if (!identity) {
+    clearPendingMessageCopyTap();
+    return;
+  }
+  pendingMessageCopyTap = {
+    identity,
+    expiresAt: Date.now() + MESSAGE_COPY_TAP_CLICK_WINDOW_MS,
+  };
+}
+
+function consumePendingMessageCopyTap(identity) {
+  const pending = pendingMessageCopyTap;
+  clearPendingMessageCopyTap();
+  if (!pending?.identity || !identity) {
+    return false;
+  }
+  if (pending.expiresAt < Date.now()) {
+    return false;
+  }
+  return pending.identity === identity;
+}
+
+function isMessageCopyTapWithinBounds(candidate, point) {
+  if (!candidate) {
+    return false;
+  }
+  const dx = Math.abs(Number(point?.x ?? 0) - Number(candidate.startX ?? 0));
+  const dy = Math.abs(Number(point?.y ?? 0) - Number(candidate.startY ?? 0));
+  return dx <= MESSAGE_COPY_TAP_MAX_MOVE_PX && dy <= MESSAGE_COPY_TAP_MAX_MOVE_PX;
+}
+
+function hasActiveSelectableText() {
+  if (typeof window === "undefined" || typeof window.getSelection !== "function") {
+    return false;
+  }
+  const selection = window.getSelection();
+  return Boolean(String(selection?.toString() || "").trim());
+}
+
+function suppressMessageCopyMenuForNativeSelection() {
+  messageCopySelectionSuppressUntil = Date.now() + MESSAGE_COPY_SELECTION_SUPPRESS_MS;
+}
+
+function shouldSuppressMessageCopyMenuForSelection() {
+  if (hasActiveSelectableText()) {
+    suppressMessageCopyMenuForNativeSelection();
+    return true;
+  }
+  return messageCopySelectionSuppressUntil > Date.now();
+}
+
+function beginMessageCopyTapCandidate(event) {
+  if (
+    !shouldUseTapMessageCopyMenu(event) ||
+    shouldIgnoreMessageCopyTarget(event.target) ||
+    shouldSuppressMessageCopyMenuForSelection()
+  ) {
+    clearMessageCopyTapCandidate();
+    clearPendingMessageCopyTap();
+    return;
+  }
+  const node = findMessageCopyNodeFromTarget(event.target);
+  if (!(node instanceof HTMLElement)) {
+    clearMessageCopyTapCandidate();
+    return;
+  }
+  const identity = getMessageCopyIdentityFromNode(node);
+  if (!identity) {
+    clearMessageCopyTapCandidate();
+    return;
+  }
+  const point = getMessageCopyInteractionPoint(event);
+  messageCopyTapCandidate = {
+    identity,
+    startX: point.x,
+    startY: point.y,
+    startedAt: Date.now(),
+  };
+}
+
+function updateMessageCopyTapCandidate(event) {
+  if (!messageCopyTapCandidate || !shouldUseTapMessageCopyMenu(event)) {
+    return;
+  }
+  if (!isMessageCopyTapWithinBounds(messageCopyTapCandidate, getMessageCopyInteractionPoint(event))) {
+    clearMessageCopyTapCandidate();
+  }
+}
+
+function finalizeMessageCopyTapCandidate(event) {
+  const candidate = messageCopyTapCandidate;
+  clearMessageCopyTapCandidate();
+  if (!candidate || !shouldUseTapMessageCopyMenu(event)) {
+    clearPendingMessageCopyTap();
+    return;
+  }
+  const node = findMessageCopyNodeFromTarget(event.target);
+  if (!(node instanceof HTMLElement)) {
+    clearPendingMessageCopyTap();
+    return;
+  }
+  const identity = getMessageCopyIdentityFromNode(node);
+  const elapsed = Date.now() - Number(candidate.startedAt || 0);
+  if (
+    identity &&
+    identity === candidate.identity &&
+    elapsed <= MESSAGE_COPY_TAP_MAX_DURATION_MS &&
+    isMessageCopyTapWithinBounds(candidate, getMessageCopyInteractionPoint(event))
+  ) {
+    rememberPendingMessageCopyTap(identity);
+    return;
+  }
+  clearPendingMessageCopyTap();
+}
+
 function escapeMessageCopyKeyForSelector(value) {
   const source = String(value || "").trim();
   if (!source) {
@@ -13102,6 +13259,10 @@ function syncActiveMessageCopyTargetDom() {
 
 function openMessageContextMenuFromInteraction(event, node = findMessageCopyNodeFromTarget(event.target)) {
   if (!(node instanceof HTMLElement)) {
+    return false;
+  }
+  if (shouldSuppressMessageCopyMenuForSelection()) {
+    clearPendingMessageCopyTap();
     return false;
   }
   if (!shouldUseTapMessageCopyMenu(event)) {
@@ -13153,6 +13314,12 @@ function bindMessageCopyMenus() {
   messageCopyMenuListenersBound = true;
 
   document.addEventListener("contextmenu", (event) => {
+    if (shouldSuppressMessageCopyMenuForSelection()) {
+      return;
+    }
+    if (shouldBypassContextMenuForTouch(event)) {
+      return;
+    }
     const node = findMessageCopyNodeFromTarget(event.target);
     if (!(node instanceof HTMLElement) || shouldIgnoreMessageCopyTarget(event.target)) {
       return;
@@ -13167,12 +13334,62 @@ function bindMessageCopyMenus() {
     );
   }, true);
 
+  if (typeof PointerEvent !== "undefined") {
+    document.addEventListener("pointerdown", (event) => {
+      beginMessageCopyTapCandidate(event);
+    }, true);
+    document.addEventListener("pointermove", (event) => {
+      updateMessageCopyTapCandidate(event);
+    }, true);
+    document.addEventListener("pointerup", (event) => {
+      finalizeMessageCopyTapCandidate(event);
+    }, true);
+    document.addEventListener("pointercancel", () => {
+      clearMessageCopyTapCandidate();
+      clearPendingMessageCopyTap();
+    }, true);
+  } else if (typeof TouchEvent !== "undefined") {
+    document.addEventListener("touchstart", (event) => {
+      beginMessageCopyTapCandidate(event);
+    }, true);
+    document.addEventListener("touchmove", (event) => {
+      updateMessageCopyTapCandidate(event);
+    }, true);
+    document.addEventListener("touchend", (event) => {
+      finalizeMessageCopyTapCandidate(event);
+    }, true);
+    document.addEventListener("touchcancel", () => {
+      clearMessageCopyTapCandidate();
+      clearPendingMessageCopyTap();
+    }, true);
+  }
+
+  document.addEventListener("selectionchange", () => {
+    if (!hasActiveSelectableText()) {
+      return;
+    }
+    suppressMessageCopyMenuForNativeSelection();
+    clearMessageCopyTapCandidate();
+    clearPendingMessageCopyTap();
+    closeMessageContextMenu();
+  }, true);
+
   document.addEventListener("click", (event) => {
     const node = findMessageCopyNodeFromTarget(event.target);
     if (!(node instanceof HTMLElement)) {
       return;
     }
     if (!shouldUseTapMessageCopyMenu(event)) {
+      return;
+    }
+    if (shouldSuppressMessageCopyMenuForSelection()) {
+      clearPendingMessageCopyTap();
+      return;
+    }
+    if (!consumePendingMessageCopyTap(getMessageCopyIdentityFromNode(node))) {
+      return;
+    }
+    if (hasActiveSelectableText()) {
       return;
     }
     openMessageContextMenuFromInteraction(event, node);
