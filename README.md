@@ -1,4 +1,7 @@
-﻿# Syncodex
+# Syncodex
+
+[![CI](https://github.com/taolin7406/syncodex-public/actions/workflows/ci.yml/badge.svg)](https://github.com/taolin7406/syncodex-public/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/taolin7406/syncodex-public)](LICENSE)
 
 Syncodex is an unofficial Windows bridge that mirrors the official Codex desktop app
 into a browser and phone-friendly UI.
@@ -15,6 +18,9 @@ model itself and does not write directly to the official SQLite database.
 
 Syncodex is currently a Windows-only project built around the official Codex desktop app.
 It is optimized for local single-user usage, browser monitoring, and phone access.
+
+This public repository contains the code, documentation, and release-facing project
+files for the public version of Syncodex.
 
 ## Features
 
@@ -54,7 +60,7 @@ Normal running state is:
 
 - Windows 10 or Windows 11
 - Official Codex desktop app installed and usable on the same machine
-- Access to the local Codex data directory under `%USERPROFILE%\\.codex`
+- Access to the local Codex data directory under `%USERPROFILE%\.codex`
 
 ## Quick Start
 
@@ -144,7 +150,17 @@ Important properties:
 - [Chinese user manual](docs/user-manual.zh-CN.md)
 - [Chinese requirements and implementation summary](docs/requirements-and-implementation.zh-CN.md)
 - [Architecture notes](docs/architecture.md)
-- [Private/public repo split plan](docs/repo-split-plan.zh-CN.md)
+- [Changelog](CHANGELOG.md)
+- [Contribution guide](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+- [Code of conduct](CODE_OF_CONDUCT.md)
+
+## Releases
+
+This repository is source-first. If packaged public builds are published, they should
+appear under GitHub Releases for this repository.
+
+For maintainers, see [RELEASING.md](RELEASING.md).
 
 ## Non-Goals
 

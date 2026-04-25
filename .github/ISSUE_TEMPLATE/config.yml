@@ -1,1 +1,8 @@
 blank_issues_enabled: true
+contact_links:
+  - name: Security policy
+    url: https://github.com/taolin7406/syncodex-public/blob/main/SECURITY.md
+    about: Please do not report security issues in public issues.
+  - name: User manual
+    url: https://github.com/taolin7406/syncodex-public/blob/main/docs/user-manual.zh-CN.md
+    about: Check the user documentation before opening a new issue.
