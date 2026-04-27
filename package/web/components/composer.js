@@ -5,6 +5,7 @@ const CODEX_LAUNCH_STORAGE_KEY = "remote-agent-console.codexLaunch.v1";
 
 export const CLIENT_FALLBACK_CODEX_UI_OPTIONS = {
   models: [
+    { id: "gpt-5.5", label: "GPT-5.5" },
     { id: "gpt-5.4", label: "gpt-5.4" },
     { id: "gpt-5.4-mini", label: "GPT-5.4-Mini" },
     { id: "gpt-5.3-codex", label: "gpt-5.3-codex" },

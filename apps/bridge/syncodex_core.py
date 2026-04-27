@@ -54,6 +54,24 @@ def normalize_windows_path(value: str | None) -> str:
     return value
 
 
+def trim_local_file_reference(value: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    text = re.sub(r"[?#].*$", "", text)
+    for _ in range(2):
+        match = re.match(r"^(.*):(\d+)$", text)
+        if not match:
+            break
+        head = str(match.group(1) or "")
+        if re.fullmatch(r"[A-Za-z]:", head):
+            break
+        text = head
+
+    return text.strip()
+
+
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
@@ -1809,6 +1827,40 @@ class SyncodexCore:
                 self.tts_dir = root_resolved
                 return path
         raise NotFoundError("TTS audio not found.")
+
+    def get_local_file_path(self, requested_path: str) -> Path:
+        raw = str(requested_path or "").strip()
+        if not raw:
+            raise NotFoundError("Local file not found.")
+
+        candidate = raw
+        if raw.lower().startswith("file://"):
+            from urllib.parse import unquote, urlparse
+
+            parsed = urlparse(raw)
+            if parsed.scheme.lower() != "file":
+                raise NotFoundError("Local file not found.")
+            if parsed.netloc and parsed.netloc.lower() != "localhost":
+                candidate = f"//{parsed.netloc}{unquote(parsed.path or '')}"
+            else:
+                candidate = unquote(parsed.path or "")
+
+        candidate = normalize_windows_path(trim_local_file_reference(candidate))
+        if re.fullmatch(r"/[A-Za-z]:[\\/].*", candidate):
+            candidate = candidate[1:]
+        if not candidate:
+            raise NotFoundError("Local file not found.")
+
+        path = Path(candidate).expanduser()
+        try:
+            resolved = path.resolve(strict=True)
+        except OSError as exc:
+            raise NotFoundError("Local file not found.") from exc
+
+        if not resolved.exists() or not resolved.is_file():
+            raise NotFoundError("Local file not found.")
+
+        return resolved
 
     def save_attachments(self, session_id: str, attachments: list[dict[str, Any]]) -> dict[str, Any]:
         thread = self.reader.get_thread(session_id)

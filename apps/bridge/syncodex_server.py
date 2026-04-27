@@ -7,7 +7,7 @@ import os
 import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
 
 from syncodex_core import NotFoundError, SyncodexCore, SyncodexError
 
@@ -41,6 +41,10 @@ class SyncodexHandler(BaseHTTPRequestHandler):
             return self._json(200, self.core.health())
         if path == "/api/projects":
             return self._json(200, self.core.list_projects())
+        if path == "/api/local-file":
+            query = parse_qs(parsed.query)
+            requested_path = query.get("path", [""])[0]
+            return self._local_file(self.core.get_local_file_path(requested_path))
         if path == "/api/projects/browse":
             query = parse_qs(parsed.query)
             current = query.get("path", [""])[0]
@@ -252,6 +256,34 @@ class SyncodexHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "public, max-age=604800")
         self.end_headers()
         self.wfile.write(data)
+
+    def _local_file(self, path: Path) -> None:
+        file_size = path.stat().st_size
+        content_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+        if content_type.startswith("text/") or content_type in {
+            "application/javascript",
+            "application/json",
+            "application/xml",
+        }:
+            content_type = f"{content_type}; charset=utf-8"
+
+        filename = path.name or "download"
+        encoded_name = quote(filename)
+
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(file_size))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Disposition", f"inline; filename*=UTF-8''{encoded_name}")
+        self.send_header("X-Syncodex-Local-File", "1")
+        self.end_headers()
+
+        with path.open("rb") as handle:
+            while True:
+                chunk = handle.read(64 * 1024)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
 
     def _json(self, status: int, payload: dict) -> None:
         data = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")

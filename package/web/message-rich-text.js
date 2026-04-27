@@ -7,6 +7,70 @@ export function escapeHtml(value) {
     .replaceAll("'", "&#39;");
 }
 
+const LOCAL_FILE_API_PREFIX = "/api/local-file?path=";
+
+function trimLocalFileReference(value) {
+  let next = String(value || "").trim();
+  if (!next) {
+    return "";
+  }
+
+  next = next.replace(/[?#].*$/, "");
+
+  for (let index = 0; index < 2; index += 1) {
+    const match = next.match(/^(.*):(\d+)$/);
+    if (!match) {
+      break;
+    }
+    const head = String(match[1] || "");
+    if (/^[A-Za-z]:$/.test(head)) {
+      break;
+    }
+    next = head;
+  }
+
+  return next.trim();
+}
+
+function normalizeLocalFileHref(href) {
+  const value = String(href || "").trim();
+  if (!value) {
+    return null;
+  }
+
+  let candidate = value;
+  if (/^file:\/\//i.test(candidate)) {
+    try {
+      const url = new URL(candidate);
+      if (url.protocol.toLowerCase() !== "file:") {
+        return null;
+      }
+      candidate = decodeURIComponent(`${url.host ? `//${url.host}` : ""}${url.pathname || ""}`);
+    } catch {
+      return null;
+    }
+  }
+
+  if (/^\/[A-Za-z]:[\\/]/.test(candidate)) {
+    candidate = candidate.slice(1);
+  }
+
+  candidate = trimLocalFileReference(candidate);
+  if (!candidate) {
+    return null;
+  }
+
+  const isWindowsAbsolute =
+    /^[A-Za-z]:[\\/]/.test(candidate) ||
+    /^\\\\[^\\]+\\[^\\]+/.test(candidate);
+  const isPosixAbsolute = /^\/(?!\/)/.test(candidate);
+  if (!isWindowsAbsolute && !isPosixAbsolute) {
+    return null;
+  }
+
+  return `${LOCAL_FILE_API_PREFIX}${encodeURIComponent(candidate)}`;
+}
+
 function prepareMarkdownSource(text, options = {}) {
   const raw = String(text ?? "");
   if (!raw.trim()) {
@@ -86,6 +150,11 @@ function sanitizeHref(href) {
   const value = String(href || "").trim();
   if (!value) {
     return null;
+  }
+
+  const localFileHref = normalizeLocalFileHref(value);
+  if (localFileHref) {
+    return localFileHref;
   }
 
   if (
