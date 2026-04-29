@@ -4,6 +4,8 @@
 Syncodex-mobile-access.html
 dist/
 build/
+dist_build/
+build_tmp/
 dist_test/
 build_test/
 __pycache__/

@@ -1320,7 +1320,7 @@ class ThreadMessageSender:
                 cwd=target_cwd or None,
                 text=True,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
                 creationflags=creationflags,
             )
             stdout_line = proc.stdout.readline() if proc.stdout else ""
@@ -1336,11 +1336,17 @@ class ThreadMessageSender:
         sender_payload = parse_sender_stdout(stdout_line)
         if not sender_payload:
             returncode = proc.poll()
+            stderr_text = ""
             if returncode is None:
                 try:
                     proc.terminate()
                 except Exception:
                     pass
+            else:
+                try:
+                    stderr_text = proc.stderr.read() if proc.stderr else ""
+                except Exception:
+                    stderr_text = ""
             return {
                 "thread_id": "",
                 "threadId": "",
@@ -1348,8 +1354,8 @@ class ThreadMessageSender:
                 "deliveryMode": "official_app_server",
                 "returncode": returncode,
                 "stdout": stdout_line[-4000:],
-                "stderr": "",
-                "error": "Codex app-server did not return a create-thread result.",
+                "stderr": stderr_text[-4000:],
+                "error": (stderr_text or "Codex app-server did not return a create-thread result.").strip(),
             }
 
         if proc.stdout:
@@ -2105,6 +2111,16 @@ class SyncodexCore:
         session = self._apply_forced_idle(session)
         self.pending_created_sessions.pop(session_id, None)
         return session
+
+    def sync_session(self, session_id: str) -> dict[str, Any]:
+        session = self.get_session(session_id)
+        return {
+            "ok": True,
+            "synced": True,
+            "appendedEvents": 0,
+            "sessionId": session.get("sessionId") or session_id,
+            "sourceKind": session.get("sourceKind") or session.get("source") or "official_codex_thread",
+        }
 
     def _attach_official_queue(
         self,

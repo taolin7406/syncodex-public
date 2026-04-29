@@ -142,6 +142,8 @@ class SyncodexHandler(BaseHTTPRequestHandler):
             )
 
         parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "sync":
+            return self._json(200, self.core.sync_session(parts[2]))
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "stop":
             return self._json(200, self.core.stop_session(parts[2]))
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "attachments":

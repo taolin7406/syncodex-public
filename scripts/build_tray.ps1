@@ -46,42 +46,22 @@ if (-not $hasQrcode) {
 
 $Exe = Join-Path $Dist "Syncodex.exe"
 $LegacyExe = Join-Path $Dist "SyncodexNext.exe"
+$BuildDistRoot = Join-Path $Root "dist_build"
+$BuildStamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$BuildDist = Join-Path $BuildDistRoot ("syncodex-" + $BuildStamp)
+$BuildWorkRoot = Join-Path $Root "build_tmp"
+$BuildWork = Join-Path $BuildWorkRoot ("syncodex-" + $BuildStamp)
 
-function Remove-FileWithRetry {
-  param(
-    [Parameter(Mandatory = $true)]
-    [string]$Path,
-    [int]$Attempts = 20,
-    [int]$DelayMs = 300
-  )
-
-  if (-not (Test-Path -LiteralPath $Path)) {
-    return
-  }
-
-  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-    try {
-      Remove-Item -LiteralPath $Path -Force
-      return
-    } catch {
-      if ($attempt -ge $Attempts) {
-        throw
-      }
-      Start-Sleep -Milliseconds $DelayMs
-    }
-  }
-}
-
-if (Test-Path -LiteralPath $Exe) {
-  Remove-FileWithRetry -Path $Exe
-}
+New-Item -ItemType Directory -Path $BuildDist -Force | Out-Null
+New-Item -ItemType Directory -Path $BuildWork -Force | Out-Null
 
 py -m PyInstaller `
   --noconfirm `
-  --clean `
   --onefile `
   --windowed `
   --name Syncodex `
+  --distpath $BuildDist `
+  --workpath $BuildWork `
   --paths (Join-Path $Root "apps\bridge") `
   --paths (Join-Path $Root "apps\tray") `
   --hidden-import qrcode `
@@ -94,11 +74,14 @@ if ($LASTEXITCODE -ne 0) {
   throw "PyInstaller build failed."
 }
 
-if (-not (Test-Path -LiteralPath $Exe)) {
-  throw "Build finished but executable was not found: $Exe"
+$BuiltExe = Join-Path $BuildDist "Syncodex.exe"
+if (-not (Test-Path -LiteralPath $BuiltExe)) {
+  throw "Build finished but executable was not found: $BuiltExe"
 }
 
+Copy-Item -LiteralPath $BuiltExe -Destination $Exe -Force
 Copy-Item -LiteralPath $Exe -Destination $LegacyExe -Force
 
 Write-Host "Built: $Exe"
+Write-Host "Build source: $BuiltExe"
 Write-Host "Updated legacy compatibility entry: $LegacyExe"
