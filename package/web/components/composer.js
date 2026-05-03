@@ -231,7 +231,7 @@ function renderComposerQuotaPopover(detailState) {
 }
 
 function ensureDetailCodexLaunch(detailState, uiOptions) {
-  const current = detailState.codexLaunch ?? loadCodexLaunchPrefs();
+  const current = detailState.codexLaunch ?? defaultCodexLaunch();
   const normalized = normalizeCodexLaunchAgainstUi(current, uiOptions);
 
   if (
@@ -241,7 +241,6 @@ function ensureDetailCodexLaunch(detailState, uiOptions) {
     detailState.codexLaunch.profile !== normalized.profile
   ) {
     detailState.codexLaunch = normalized;
-    persistCodexLaunchPrefs(normalized);
   }
 
   return detailState.codexLaunch;
@@ -427,7 +426,7 @@ function isSessionComposerBusy(session) {
 export function defaultCodexLaunch() {
   return {
     modelId: "",
-    reasoningId: "medium",
+    reasoningId: "",
     profile: "",
   };
 }
@@ -462,7 +461,7 @@ export function loadCodexLaunchPrefs() {
     return {
       ...base,
       modelId,
-      reasoningId: reasoningId || "medium",
+      reasoningId,
       profile: typeof parsed.profile === "string" ? parsed.profile : "",
     };
   } catch {
@@ -471,20 +470,28 @@ export function loadCodexLaunchPrefs() {
 }
 
 export function normalizeCodexLaunchAgainstUi(prefs, uiOptions) {
+  const source = prefs && typeof prefs === "object" ? prefs : {};
   const opts =
     uiOptions && Array.isArray(uiOptions.models) && uiOptions.models.length > 0
       ? uiOptions
       : CLIENT_FALLBACK_CODEX_UI_OPTIONS;
   const modelIds = new Set(opts.models.map((m) => m.id));
   const reasoningIds = new Set(opts.reasoningLevels.map((r) => r.id));
-  let { modelId, reasoningId } = prefs;
-  if (!modelId || !modelIds.has(modelId)) {
-    modelId = opts.models[0]?.id || "";
+  let modelId = typeof source.modelId === "string" ? source.modelId.trim() : "";
+  let reasoningId = typeof source.reasoningId === "string" ? source.reasoningId.trim() : "";
+  if (modelId && !modelIds.has(modelId)) {
+    modelId = "";
   }
-  if (!reasoningId || !reasoningIds.has(reasoningId)) {
-    reasoningId = "medium";
+  if (reasoningId && !reasoningIds.has(reasoningId)) {
+    reasoningId = "";
   }
-  return { ...prefs, modelId, reasoningId };
+  return {
+    ...defaultCodexLaunch(),
+    ...source,
+    modelId,
+    reasoningId,
+    profile: typeof source.profile === "string" ? source.profile : "",
+  };
 }
 
 function persistCodexLaunchPrefs(prefs) {
@@ -536,18 +543,20 @@ export function renderComposerInput({ session, detailState, uiOptions }) {
       ? uiOptions
       : CLIENT_FALLBACK_CODEX_UI_OPTIONS;
   const launch = ensureDetailCodexLaunch(detailState, opts);
-  const modelOptionsHtml = opts.models
-    .map(
+  const modelOptionsHtml = [
+    `<option value="" ${launch.modelId ? "" : "selected"}>${escapeHtml(t("composer.model.noOverride"))}</option>`,
+    ...opts.models.map(
       (model) =>
         `<option value="${escapeHtml(model.id)}" ${launch.modelId === model.id ? "selected" : ""}>${escapeHtml(model.label)}</option>`,
-    )
-    .join("");
-  const reasoningOptionsHtml = opts.reasoningLevels
-    .map(
+    ),
+  ].join("");
+  const reasoningOptionsHtml = [
+    `<option value="" ${launch.reasoningId ? "" : "selected"}>${escapeHtml(t("composer.reasoning.noOverride"))}</option>`,
+    ...opts.reasoningLevels.map(
       (level) =>
         `<option value="${escapeHtml(level.id)}" ${launch.reasoningId === level.id ? "selected" : ""}>${escapeHtml(getReasoningLabel(level.id, level.label))}</option>`,
-    )
-    .join("");
+    ),
+  ].join("");
   const activeHost = detailState.activeRemoteHost || "--";
   const isBusy = isSessionComposerBusy(session);
   const attachmentItems = Array.isArray(detailState.composerAttachments)
@@ -687,6 +696,7 @@ export function renderComposerInput({ session, detailState, uiOptions }) {
             id="composer-action"
             class="composer-action-fab composer-action-fab--send"
             aria-label="${escapeHtml(t("composer.aria.send"))}"
+            title="${escapeHtml(isBusy ? t("composer.aria.queue") : t("composer.aria.send"))}"
           >
             <svg class="composer-action-icon" width="20" height="20" viewBox="0 0 24 24" aria-hidden="true">
               <path
@@ -695,6 +705,28 @@ export function renderComposerInput({ session, detailState, uiOptions }) {
               />
             </svg>
           </button>
+          ${
+            isBusy
+              ? `<button
+                  type="button"
+                  id="composer-steer-action"
+                  class="composer-steer-fab"
+                  aria-label="${escapeHtml(t("composer.aria.steer"))}"
+                  title="${escapeHtml(t("composer.aria.steer"))}"
+                >
+                  <svg class="composer-action-icon composer-steer-icon" width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+                    <path
+                      d="M5 12h10.5M12 5l7 7-7 7"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      stroke-width="2.2"
+                    />
+                  </svg>
+                </button>`
+              : ""
+          }
           ${
             isBusy
               ? `<button

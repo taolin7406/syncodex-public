@@ -33,6 +33,18 @@ class SyncodexHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._handle_exception(exc)
 
+    def do_PATCH(self) -> None:
+        try:
+            self._handle_patch()
+        except Exception as exc:
+            self._handle_exception(exc)
+
+    def do_DELETE(self) -> None:
+        try:
+            self._handle_delete()
+        except Exception as exc:
+            self._handle_exception(exc)
+
     def _handle_get(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
@@ -101,12 +113,19 @@ class SyncodexHandler(BaseHTTPRequestHandler):
                         "items": timeline["messages"],
                     },
                 )
+            if len(parts) == 4 and parts[3] == "queue":
+                return self._json(200, self.core.get_official_queue(session_id))
 
         return self._static(path)
 
     def _handle_post(self) -> None:
         parsed = urlparse(self.path)
         path = parsed.path.rstrip("/") or "/"
+        if path == "/api/client-debug":
+            body = self._read_json_body()
+            self._log_client_debug(body)
+            return self._json(200, {"ok": True})
+
         if path == "/api/tts":
             body = self._read_json_body()
             text = body.get("text") or body.get("content") or ""
@@ -130,6 +149,12 @@ class SyncodexHandler(BaseHTTPRequestHandler):
                 or body.get("effort")
                 or ""
             ).strip()
+            client_create_id = (
+                body.get("clientCreateId")
+                or body.get("client_create_id")
+                or body.get("eventId")
+                or ""
+            )
             return self._json(
                 200,
                 self.core.create_session(
@@ -138,6 +163,7 @@ class SyncodexHandler(BaseHTTPRequestHandler):
                     cwd=cwd,
                     model=model,
                     reasoning_effort=reasoning_effort,
+                    client_create_id=str(client_create_id),
                 ),
             )
 
@@ -187,6 +213,128 @@ class SyncodexHandler(BaseHTTPRequestHandler):
                     },
                 )
             return self._json(200, result)
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "queue":
+            body = self._read_json_body()
+            message = (
+                body.get("message")
+                or body.get("text")
+                or body.get("content")
+                or body.get("prompt")
+                or ""
+            )
+            attachments = body.get("attachments") or []
+            client_message_id = (
+                body.get("clientMessageId")
+                or body.get("client_message_id")
+                or body.get("eventId")
+                or ""
+            )
+            result = self.core.enqueue_official_followup(
+                parts[2],
+                str(message),
+                attachments=attachments,
+                client_message_id=str(client_message_id),
+            )
+            if result.get("status") == "failed" or result.get("ok") is False:
+                return self._json(
+                    400,
+                    {
+                        "error": "queue_failed",
+                        "message": result.get("error") or "Codex did not accept the queued follow-up.",
+                        "result": result,
+                    },
+                )
+            return self._json(200, result)
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "steer":
+            body = self._read_json_body()
+            message = (
+                body.get("message")
+                or body.get("text")
+                or body.get("content")
+                or body.get("prompt")
+                or ""
+            )
+            attachments = body.get("attachments") or []
+            client_message_id = (
+                body.get("clientMessageId")
+                or body.get("client_message_id")
+                or body.get("eventId")
+                or ""
+            )
+            result = self.core.steer_message(
+                parts[2],
+                str(message),
+                attachments=attachments,
+                client_message_id=str(client_message_id),
+            )
+            if result.get("status") == "failed" or result.get("ok") is False:
+                return self._json(
+                    400,
+                    {
+                        "error": "steer_failed",
+                        "message": result.get("error") or "Codex did not accept the steering message.",
+                        "result": result,
+                    },
+                )
+            return self._json(200, result)
+        return self._json(404, {"error": "not_found"})
+
+    def _handle_patch(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "sessions":
+            body = self._read_json_body()
+            result = self.core.update_session_metadata(
+                parts[2],
+                action=str(body.get("action") or ""),
+                title=str(body.get("title") or body.get("name") or ""),
+                pinned=body.get("pinned") if "pinned" in body else None,
+            )
+            return self._json(200, result)
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "queue":
+            body = self._read_json_body()
+            message = (
+                body.get("message")
+                or body.get("text")
+                or body.get("content")
+                or body.get("prompt")
+                or ""
+            )
+            action = str(body.get("action") or "").strip()
+            result = self.core.update_official_followup(parts[2], parts[4], str(message), action)
+            if result.get("status") == "failed" or result.get("ok") is False:
+                return self._json(
+                    400,
+                    {
+                        "error": "queue_update_failed",
+                        "message": result.get("error") or "Codex did not accept the queue update.",
+                        "result": result,
+                    },
+                )
+            return self._json(200, result)
+        return self._json(404, {"error": "not_found"})
+
+    def _handle_delete(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        parts = [unquote(part) for part in path.split("/") if part]
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "attachments":
+            body = self._read_json_body()
+            attachments = body.get("attachments") or body.get("files") or []
+            return self._json(200, self.core.delete_attachments(parts[2], attachments))
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "sessions" and parts[3] == "queue":
+            result = self.core.delete_official_followup(parts[2], parts[4])
+            if result.get("status") == "failed" or result.get("ok") is False:
+                return self._json(
+                    400,
+                    {
+                        "error": "queue_delete_failed",
+                        "message": result.get("error") or "Codex did not accept the queue delete.",
+                        "result": result,
+                    },
+                )
+            return self._json(200, result)
         return self._json(404, {"error": "not_found"})
 
     def _event_query(self, query: dict[str, list[str]]) -> dict[str, int]:
@@ -207,6 +355,15 @@ class SyncodexHandler(BaseHTTPRequestHandler):
             return json.loads(raw.decode("utf-8"))
         except json.JSONDecodeError:
             return {}
+
+    def _log_client_debug(self, payload: dict) -> None:
+        access_log = getattr(self.server, "syncodex_access_log", None)
+        if not callable(access_log):
+            return
+        try:
+            access_log("[client-debug] " + json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        except Exception:
+            access_log("[client-debug] <unserializable>")
 
     def _static(self, path: str) -> None:
         if path == "/":

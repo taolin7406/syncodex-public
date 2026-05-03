@@ -17,9 +17,61 @@
       <section id="app" class="page page-root"></section>
     </main>
 
+    <script>
+      if (!String.prototype.replaceAll) {
+        String.prototype.replaceAll = function (search, replacement) {
+          return String(this).split(search).join(replacement);
+        };
+      }
+      if (!Array.prototype.at) {
+        Array.prototype.at = function (index) {
+          var normalized = Math.trunc(index) || 0;
+          if (normalized < 0) normalized += this.length;
+          return this[normalized];
+        };
+      }
+      if (!window.crypto) {
+        window.crypto = {};
+      }
+      if (!window.crypto.randomUUID) {
+        window.crypto.randomUUID = function () {
+          return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (char) {
+            var value = Math.random() * 16 | 0;
+            var digit = char === "x" ? value : (value & 0x3) | 0x8;
+            return digit.toString(16);
+          });
+        };
+      }
+    </script>
     <script src="/vendor/markdown-it.js"></script>
     <script>
       (function () {
+        function reportBootDebug(reason, detail) {
+          try {
+            fetch("/api/client-debug", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                at: new Date().toISOString(),
+                reason: reason,
+                detail: String(detail || ""),
+                href: location.href,
+                hash: location.hash,
+                userAgent: navigator.userAgent,
+                viewport: {
+                  width: innerWidth,
+                  height: innerHeight,
+                  visualWidth: (visualViewport && visualViewport.width) || 0,
+                  visualHeight: (visualViewport && visualViewport.height) || 0
+                },
+                rootTextLength: (document.getElementById("app") && document.getElementById("app").innerText || "").length
+              }),
+              cache: "no-store",
+              keepalive: true
+            }).catch(function () {});
+          } catch (error) {}
+        }
+
         function showBootError(message) {
           const root = document.getElementById("app");
           if (!root) return;
@@ -27,18 +79,21 @@
             '<section style="padding:24px"><div style="border:1px solid rgba(180,35,24,.25);border-radius:12px;background:#fff7f6;color:#b42318;padding:16px 18px;font:14px/1.6 system-ui,sans-serif"><strong style="display:block;margin-bottom:8px">Syncodex 前端加载失败</strong><div style="white-space:pre-wrap;overflow-wrap:anywhere">' +
             String(message || "Unknown error") +
             "</div></div></section>";
+          reportBootDebug("boot-error-visible", message);
         }
 
         window.addEventListener("error", function (event) {
+          reportBootDebug("window-error", event && event.message);
           showBootError(event && event.error ? event.error.stack || event.error.message : event.message);
         });
 
         window.addEventListener("unhandledrejection", function (event) {
           const reason = event && event.reason;
+          reportBootDebug("unhandledrejection", reason && reason.stack ? reason.stack : reason);
           showBootError(reason && reason.stack ? reason.stack : reason);
         });
       })();
     </script>
-    <script type="module" src="/app.js"></script>
+    <script src="/app.bundle.js"></script>
   </body>
   </html>

@@ -2,7 +2,11 @@ import {
   browseProjectDirectories,
   createTtsAudio,
   createProject,
+  deleteQueuedMessage,
+  deleteSessionAttachments,
+  getSessionQueue,
   importCodexSession,
+  queueMessage,
   createSession,
   getCodexHosts,
   getImportableCodexSessions,
@@ -18,8 +22,11 @@ import {
   resolveSessionApproval,
   retrySessionApproval,
   sendMessage,
+  steerMessage,
   stopSession,
   syncImportedSession,
+  updateSession,
+  updateQueuedMessage,
   uploadSessionAttachments,
 } from "./api.js";
 import {
@@ -27,7 +34,6 @@ import {
   adjustComposerHeight,
   bindComposerInputControls,
   buildCodexLaunchPayload,
-  loadCodexLaunchPrefs,
   normalizeCodexLaunchAgainstUi,
   renderComposerInput,
 } from "./components/composer.js";
@@ -79,8 +85,6 @@ const COMMAND_RUNNING_PREVIEW_LINES = 3;
 const COMMAND_COLLAPSED_SUMMARY_MAX = 120;
 const COMMAND_EXPANDED_OUTPUT_MAX_LINES = 80;
 const INITIAL_DETAIL_EVENT_PAGE_LIMIT = 200;
-const INITIAL_DETAIL_MIN_TURNS = 4;
-const INITIAL_DETAIL_MAX_PAGES = 5;
 const SESSION_DETAIL_CACHE_MAX_SESSIONS = 12;
 const SESSION_DETAIL_CACHE_MAX_RAW_EVENTS = 180;
 const DETAIL_RENDER_BATCH_MS = 0;
@@ -96,9 +100,16 @@ const COMPOSER_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024;
 const COMPOSER_ATTACHMENT_TOTAL_MAX_BYTES = 60 * 1024 * 1024;
 const COMPOSER_SEND_DEDUPE_WINDOW_MS = 4000;
 const MOBILE_SEND_QUEUE_LOCK_MS = 90_000;
+const LEGACY_LOCAL_QUEUE_FLUSH_ENABLED = false;
 const WORKSPACE_UNREAD_BADGE_MAX = 99;
 const WORKSPACE_SESSIONS_REFRESH_MS = 10000;
 const CLIENT_INSTANCE_ID = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+let clientDebugLastSentAt = 0;
+const missingDetailRecoveryAttempts = {};
+let activeRouteRenderHash = "";
+let activeRouteRenderPromise = null;
+let activeWorkspaceRenderSessionId = "";
+let activeWorkspaceRenderPromise = null;
 let lastToastMessage = "";
 let lastToastAt = 0;
 let completionAudioElement = null;
@@ -117,6 +128,159 @@ let composerSendGuard = {
   active: false,
   finishedAt: 0,
 };
+
+function collectClientDebug(extra = {}) {
+  const root = document.querySelector("#app");
+  const shell = document.querySelector(".workspace-shell");
+  const detail = document.querySelector("#session-detail-shell");
+  const transcript = document.querySelector("#session-transcript-slot");
+  const rootRect = root?.getBoundingClientRect?.();
+  const detailRect = detail?.getBoundingClientRect?.();
+  const text = String(root?.innerText || "");
+  return {
+    at: new Date().toISOString(),
+    instanceId: CLIENT_INSTANCE_ID,
+    href: window.location.href,
+    hash: window.location.hash,
+    userAgent: navigator.userAgent,
+    viewport: {
+      width: window.innerWidth,
+      height: window.innerHeight,
+      visualWidth: window.visualViewport?.width || 0,
+      visualHeight: window.visualViewport?.height || 0,
+      devicePixelRatio: window.devicePixelRatio || 1,
+    },
+    root: {
+      exists: Boolean(root),
+      childCount: root?.children?.length || 0,
+      textLength: text.length,
+      textPreview: text.slice(0, 180),
+      rect: rootRect
+        ? { x: rootRect.x, y: rootRect.y, width: rootRect.width, height: rootRect.height }
+        : null,
+    },
+    shell: {
+      exists: Boolean(shell),
+      className: shell?.className || "",
+    },
+    detail: {
+      exists: Boolean(detail),
+      className: detail?.className || "",
+      rect: detailRect
+        ? { x: detailRect.x, y: detailRect.y, width: detailRect.width, height: detailRect.height }
+        : null,
+    },
+    transcript: {
+      exists: Boolean(transcript),
+      textLength: String(transcript?.innerText || "").length,
+    },
+    ...extra,
+  };
+}
+
+function serializeClientError(error) {
+  if (!error) {
+    return { message: "" };
+  }
+  return {
+    name: String(error.name || ""),
+    message: messageOf(error),
+    stack: String(error.stack || "").slice(0, 2000),
+  };
+}
+
+function reportClientDebug(reason, extra = {}, options = {}) {
+  const now = Date.now();
+  if (!options.force && now - clientDebugLastSentAt < 2500) {
+    return;
+  }
+  clientDebugLastSentAt = now;
+  const payload = collectClientDebug({ reason, ...extra });
+  try {
+    const body = JSON.stringify(payload);
+    if (navigator.sendBeacon) {
+      const blob = new Blob([body], { type: "application/json" });
+      if (navigator.sendBeacon("/api/client-debug", blob)) {
+        return;
+      }
+    }
+    fetch("/api/client-debug", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body,
+      cache: "no-store",
+      keepalive: true,
+    }).catch(() => null);
+  } catch {
+    // Best-effort diagnostics only.
+  }
+}
+
+function installBlankScreenWatchdog() {
+  window.setTimeout(() => {
+    const text = String(app?.innerText || "").trim();
+    const hasShell = Boolean(document.querySelector(".workspace-shell"));
+    reportClientDebug("blank-screen-watchdog", { hasShell, textLength: text.length });
+    if (text || hasShell) {
+      return;
+    }
+    if (!app) {
+      return;
+    }
+    app.innerHTML = `
+      <section style="padding:24px">
+        <div style="border:1px solid rgba(180,35,24,.25);border-radius:14px;background:#fff7f6;color:#b42318;padding:16px 18px;font:14px/1.6 system-ui,sans-serif">
+          <strong style="display:block;margin-bottom:8px">Syncodex 页面启动异常</strong>
+          <div>前端资源已加载，但页面根节点仍为空。诊断信息已写入电脑端日志。</div>
+          <button type="button" onclick="location.reload()" style="margin-top:12px;border:0;border-radius:999px;background:#b42318;color:white;padding:8px 14px;font-weight:700">重新加载</button>
+        </div>
+      </section>`;
+  }, 4200);
+
+  window.setTimeout(() => {
+    const route = parseHashRoute(window.location.hash || "");
+    const matched = route.path.match(/^#\/sessions\/([^/]+)$/);
+    const sessionId = String(matched?.[1] || "").trim();
+    const hasShell = Boolean(document.querySelector(".workspace-shell"));
+    const hasDetail = Boolean(document.querySelector("#session-detail-shell"));
+    if (!sessionId || !hasShell || hasDetail) {
+      return;
+    }
+    const attempts = Number(missingDetailRecoveryAttempts[sessionId] || 0);
+    if (attempts >= 2) {
+      reportClientDebug(
+        "missing-detail-recovery-skipped",
+        { sessionId, attempts },
+        { force: true },
+      );
+      return;
+    }
+    missingDetailRecoveryAttempts[sessionId] = attempts + 1;
+    reportClientDebug(
+      "missing-detail-recovery-start",
+      { sessionId, attempt: attempts + 1 },
+      { force: true },
+    );
+    void renderWorkspacePage(sessionId)
+      .then(() => {
+        reportClientDebug(
+          "missing-detail-recovery-complete",
+          {
+            sessionId,
+            hasDetail: Boolean(document.querySelector("#session-detail-shell")),
+          },
+          { force: true },
+        );
+      })
+      .catch((error) => {
+        reportClientDebug(
+          "missing-detail-recovery-error",
+          { sessionId, error: serializeClientError(error) },
+          { force: true },
+        );
+      });
+  }, 12000);
+}
 
 stripMobileAccessTokenFromAddressBar();
 
@@ -528,8 +692,8 @@ function readCreateSessionPrefs() {
     return {
       startMode: normalizeCreateSessionStartMode(parsed?.startMode || parsed?.mode),
       cwd: typeof parsed?.cwd === "string" ? parsed.cwd : "",
-      modelId: typeof parsed?.modelId === "string" ? parsed.modelId : "",
-      reasoningId: typeof parsed?.reasoningId === "string" ? parsed.reasoningId : "",
+      modelId: "",
+      reasoningId: "",
     };
   } catch {
     return { startMode: "project", cwd: "", modelId: "", reasoningId: "" };
@@ -544,8 +708,6 @@ function writeCreateSessionPrefsFromDialog() {
       JSON.stringify({
         startMode: normalizeCreateSessionStartMode(dialogState.startMode),
         cwd: String(dialogState.customCwd || "").trim(),
-        modelId: String(dialogState.modelId || "").trim(),
-        reasoningId: String(dialogState.reasoningId || "").trim(),
       }),
     );
   } catch {
@@ -956,6 +1118,31 @@ function hasOfficialQueuedMessages(session = state.detail.session) {
   return getOfficialQueueCount(session) > 0;
 }
 
+function applyOfficialQueueResult(result, session = state.detail.session) {
+  if (!session || !result) {
+    return;
+  }
+  const items = Array.isArray(result.items) ? result.items : [];
+  session.officialQueuedFollowUps = items;
+  session.officialQueuedFollowUpsPreview = items.slice(0, 2);
+  session.officialQueueCount = Number(result.officialQueueCount ?? result.count ?? items.length) || 0;
+  session.officialQueuedFollowupCount = session.officialQueueCount;
+  session.hasOfficialQueue = session.officialQueueCount > 0;
+}
+
+async function refreshOfficialQueueForSession(sessionId) {
+  const normalizedSessionId = String(sessionId || "").trim();
+  if (!normalizedSessionId) {
+    return null;
+  }
+  const result = await getSessionQueue(normalizedSessionId);
+  if (state.detail.session?.sessionId === normalizedSessionId) {
+    applyOfficialQueueResult(result, state.detail.session);
+    scheduleSessionDetailRender();
+  }
+  return result;
+}
+
 function getUnifiedQueuedMessages(session = state.detail.session) {
   const sessionId = String(session?.sessionId || "").trim();
   const officialItems = getOfficialQueuedMessages(session).map((item) => ({
@@ -1007,6 +1194,28 @@ function clearComposerAttachments() {
   state.detail.composerAttachments = [];
   state.detail.composerUploadingAttachments = false;
   setForceComposerRender();
+}
+
+function deleteUploadedComposerAttachments(sessionId, attachments) {
+  const sessionKey = String(sessionId || "").trim();
+  const readyAttachments = (Array.isArray(attachments) ? attachments : []).filter(
+    (item) => item?.status === "ready" && item?.path,
+  );
+  if (!sessionKey || readyAttachments.length <= 0) {
+    return;
+  }
+
+  deleteSessionAttachments(sessionKey, readyAttachments).catch((error) => {
+    reportClientDebug(
+      "composer-attachment-delete-failed",
+      {
+        sessionId: sessionKey,
+        error: serializeClientError(error),
+        attachmentCount: readyAttachments.length,
+      },
+      { force: true },
+    );
+  });
 }
 
 function fileToDataUrl(file) {
@@ -1222,7 +1431,7 @@ function getComposerPlaceholderHint(session, options = {}) {
   }
   const currentBusy =
     typeof options.currentBusy === "boolean" ? options.currentBusy : isSessionLiveBusy(session);
-  if (currentBusy && isMobileWorkspaceViewport()) {
+  if (currentBusy) {
     return t("composer.queueHint");
   }
   return "";
@@ -1326,6 +1535,7 @@ function removeComposerAttachment(attachmentId) {
       /* ignore */
     }
   }
+  deleteUploadedComposerAttachments(state.detail.session?.sessionId, removed ? [removed] : []);
   state.detail.composerAttachments = items.filter((item) => item.id !== id);
   state.detail.composerUploadingAttachments = state.detail.composerAttachments.some(
     (item) => item.status === "uploading",
@@ -1552,13 +1762,6 @@ function buildTaskBlocks(events, options = {}) {
   return tasks;
 }
 
-function countUserTurns(events) {
-  return events.reduce((count, event) => {
-    const normalized = normalizeRawSessionEvent(event);
-    return normalized?.kind === "user_message" ? count + 1 : count;
-  }, 0);
-}
-
 function getLatestUserTaskKey(events) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index];
@@ -1574,38 +1777,14 @@ async function loadInitialSessionEvents(sessionId) {
   const firstPage = await getSessionTimelineEvents(sessionId, {
     limit: INITIAL_DETAIL_EVENT_PAGE_LIMIT,
   });
-  let items = Array.isArray(firstPage.items) ? [...firstPage.items] : [];
-  let beforeCursor = firstPage.beforeCursor || 0;
-  let hasMoreBefore = Boolean(firstPage.hasMoreBefore);
-  let pagesLoaded = 1;
-
-  while (
-    hasMoreBefore &&
-    beforeCursor > 1 &&
-    countUserTurns(items) < INITIAL_DETAIL_MIN_TURNS &&
-    pagesLoaded < INITIAL_DETAIL_MAX_PAGES
-  ) {
-    const nextPage = await getSessionTimelineEvents(sessionId, {
-      before: beforeCursor,
-      limit: INITIAL_DETAIL_EVENT_PAGE_LIMIT,
-    });
-
-    if (!Array.isArray(nextPage.items) || nextPage.items.length === 0) {
-      hasMoreBefore = false;
-      break;
-    }
-
-    items = [...nextPage.items, ...items];
-    beforeCursor = nextPage.beforeCursor || beforeCursor;
-    hasMoreBefore = Boolean(nextPage.hasMoreBefore);
-    pagesLoaded += 1;
-  }
 
   return {
-    items,
+    // Do not block first paint on historical backfill. Older pages are lazy-loaded after
+    // the detail shell is mounted, which is much safer over mobile tunnels.
+    items: Array.isArray(firstPage.items) ? [...firstPage.items] : [],
     nextCursor: firstPage.nextCursor || 0,
-    beforeCursor,
-    hasMoreBefore,
+    beforeCursor: firstPage.beforeCursor || 0,
+    hasMoreBefore: Boolean(firstPage.hasMoreBefore),
     lastSeq: firstPage.lastSeq || firstPage.nextCursor || 0,
   };
 }
@@ -2182,7 +2361,7 @@ function maybeQueueAutoContinueFromCompletion(events) {
     return;
   }
 
-  if (hasQueuedAutoContinueMessage(sessionId)) {
+  if (hasQueuedAutoContinueMessage(sessionId) || hasOfficialQueuedMessages(state.detail.session)) {
     return;
   }
 
@@ -2202,22 +2381,32 @@ function maybeQueueAutoContinueFromCompletion(events) {
     codex ? { content: COMPLETION_AUTO_CONTINUE_PROMPT, codex } : { content: COMPLETION_AUTO_CONTINUE_PROMPT },
     "auto-continue",
   );
-  enqueueMobileMessage(
-    sessionId,
-    {
-      origin: "syncodex_auto_continue",
-      content: COMPLETION_AUTO_CONTINUE_PROMPT,
-      payload,
-      createdAt: new Date().toISOString(),
-    },
-    { toFront: true },
-  );
-  setCompletionAutoContinueLastEventKey(sessionId, completionKey);
+  payload.clientMessageId = `auto-continue:${completionKey}`;
   if (state.detail.completionNotice?.sessionId === sessionId) {
     state.detail.completionNotice.actionStatus = t("completionActions.autoQueued");
   }
   scheduleSessionDetailRender();
-  void maybeFlushMobileSendQueue("auto-continue-queued");
+  void queueMessage(sessionId, payload)
+    .then((result) => {
+      setCompletionAutoContinueLastEventKey(sessionId, completionKey);
+      const nextRuns = getCompletionAutoContinueRuns(sessionId) + 1;
+      const nextRemaining = Math.max(0, getCompletionAutoContinueRemaining(sessionId) - 1);
+      setCompletionAutoContinueRuns(sessionId, nextRuns);
+      setCompletionAutoContinueRemaining(sessionId, nextRemaining);
+      if (state.detail.session?.sessionId === sessionId) {
+        applyOfficialQueueResult(result, state.detail.session);
+      }
+      if (state.detail.completionNotice?.sessionId === sessionId) {
+        state.detail.completionNotice.autoContinueRuns = nextRuns;
+      }
+      scheduleSessionDetailRender();
+    })
+    .catch((error) => {
+      if (state.detail.completionNotice?.sessionId === sessionId) {
+        state.detail.completionNotice.actionStatus = messageOf(error);
+      }
+      scheduleSessionDetailRender();
+    });
 }
 
 function showCompletionNotice(notice) {
@@ -2801,16 +2990,6 @@ async function sendCompletionActionMessage(content, source = "manual") {
   }
 }
 
-function shouldHoldMobileMessageForQueue() {
-  return (
-    isMobileWorkspaceViewport() &&
-    !state.detail.detailSyncing &&
-    isSessionLiveBusy(state.detail.session) &&
-    !state.detail.composerSending &&
-    !state.detail.mobileQueueSending
-  );
-}
-
 function queueMobileComposerMessage(sessionId, content, payload) {
   const prefs = getCompletionActionPrefsForSession(sessionId);
   const count = enqueueMobileMessage(sessionId, {
@@ -2829,7 +3008,78 @@ function queueMobileComposerMessage(sessionId, content, payload) {
   return count;
 }
 
+async function queueOfficialComposerMessage(sessionId, content, payload) {
+  const normalizedSessionId = String(sessionId || "").trim();
+  if (!normalizedSessionId) {
+    return false;
+  }
+
+  state.detail.composerSending = true;
+  state.detail.composerSendError = "";
+  scheduleSessionDetailRender();
+
+  try {
+    const result = await queueMessage(normalizedSessionId, payload);
+    if (state.detail.session?.sessionId === normalizedSessionId) {
+      applyOfficialQueueResult(result, state.detail.session);
+      state.detail.draft = "";
+      clearComposerDraft(normalizedSessionId);
+    }
+    clearComposerAttachments();
+    showToast(t("composer.queued", { count: result?.officialQueueCount ?? result?.count ?? 1 }));
+    return true;
+  } catch (error) {
+    const errorMessage = messageOf(error);
+    state.detail.composerSendError = errorMessage;
+    writeComposerDraft(normalizedSessionId, content);
+    if (state.detail.session?.sessionId === normalizedSessionId) {
+      state.detail.draft = content;
+    }
+    showToast(errorMessage);
+    return false;
+  } finally {
+    state.detail.composerSending = false;
+    scheduleSessionDetailRender();
+    void refreshOfficialQueueForSession(normalizedSessionId).catch(() => null);
+  }
+}
+
+async function steerComposerMessage(sessionId, content, payload) {
+  const normalizedSessionId = String(sessionId || "").trim();
+  if (!normalizedSessionId || state.detail.composerSending) {
+    return false;
+  }
+
+  state.detail.composerSending = true;
+  state.detail.composerSendError = "";
+  scheduleSessionDetailRender();
+
+  try {
+    const result = await steerMessage(normalizedSessionId, payload);
+    state.detail.draft = "";
+    clearComposerDraft(normalizedSessionId);
+    clearComposerAttachments();
+    showToast(t("composer.steered"));
+    await catchUpSessionEvents(normalizedSessionId, state.detail.cursor || 0).catch(() => null);
+    return Boolean(result);
+  } catch (error) {
+    const errorMessage = messageOf(error);
+    state.detail.composerSendError = errorMessage;
+    state.detail.draft = content;
+    writeComposerDraft(normalizedSessionId, content);
+    showToast(errorMessage);
+    return false;
+  } finally {
+    state.detail.composerSending = false;
+    scheduleSessionDetailRender();
+  }
+}
+
 async function maybeFlushMobileSendQueue(reason = "idle") {
+  if (!LEGACY_LOCAL_QUEUE_FLUSH_ENABLED) {
+    return false;
+  }
+
   const session = state.detail.session;
   const sessionId = session?.sessionId || "";
   syncMobileSendQueueStateFromStorage();
@@ -3699,7 +3949,15 @@ function renderSessionQueuePanel(session) {
             : "syncodex";
       const elapsed = item.createdAt ? formatElapsedSinceIso(item.createdAt) : "";
       const actionsMenu =
-        item.origin !== "official_codex"
+        item.origin === "official_codex"
+          ? `
+            <div class="session-queue-actions" role="menu" aria-label="${escapeHtml(t("queue.actions"))}">
+              <button type="button" class="session-queue-action" data-official-queue-action="edit" data-official-queue-id="${escapeHtml(item.id)}" role="menuitem">${escapeHtml(t("queue.edit"))}</button>
+              <button type="button" class="session-queue-action" data-official-queue-action="remove" data-official-queue-id="${escapeHtml(item.id)}" role="menuitem">${escapeHtml(t("queue.removeLocalShort"))}</button>
+              <button type="button" class="session-queue-action" data-official-queue-action="front" data-official-queue-id="${escapeHtml(item.id)}" role="menuitem">${escapeHtml(t("queue.moveLocalToFront"))}</button>
+            </div>
+          `
+          : item.origin !== "official_codex"
           ? `
             <div class="session-queue-actions" role="menu" aria-label="${escapeHtml(t("queue.actions"))}">
               <button type="button" class="session-queue-action" data-mobile-queue-action="edit" data-mobile-queue-id="${escapeHtml(item.id)}" role="menuitem">${escapeHtml(t("queue.editLocal"))}</button>
@@ -3710,9 +3968,9 @@ function renderSessionQueuePanel(session) {
           : "";
       return `
         <li class="session-queue-item session-queue-item-${origin}" ${
-          item.origin !== "official_codex"
-            ? `data-mobile-queue-item="${escapeHtml(item.id)}" role="button" tabindex="0" aria-haspopup="menu" aria-label="${escapeHtml(t("queue.openActions"))}"`
-            : ""
+          item.origin === "official_codex"
+            ? `data-official-queue-item="${escapeHtml(item.id)}" role="button" tabindex="0" aria-haspopup="menu" aria-label="${escapeHtml(t("queue.openActions"))}"`
+            : `data-mobile-queue-item="${escapeHtml(item.id)}" role="button" tabindex="0" aria-haspopup="menu" aria-label="${escapeHtml(t("queue.openActions"))}"`
         }>
           <div class="session-queue-item-head">
             <span class="session-queue-index">${index + 1}</span>
@@ -4602,6 +4860,7 @@ const state = {
     taskPlanCollapsed: initialTaskPlanCollapsed,
     localeMenuOpen: false,
     activeSessionId: "",
+    sessionContextMenu: null,
     sessionsRefreshTimerId: 0,
     sessionsRefreshInFlight: false,
     createDialog: {
@@ -4611,6 +4870,7 @@ const state = {
       submitting: false,
       selectedProjectId: "",
       firstMessage: "",
+      clientCreateId: "",
       customCwd: "",
       modelId: "",
       reasoningId: "",
@@ -4720,6 +4980,7 @@ const state = {
 };
 
 applyDocumentLocale();
+installBlankScreenWatchdog();
 window.addEventListener("hashchange", renderRoute);
 window.addEventListener("load", renderRoute);
 document.addEventListener("visibilitychange", () => {
@@ -4753,6 +5014,20 @@ document.addEventListener(
 );
 
 function renderRoute() {
+  const hash = window.location.hash || "#/sessions";
+  if (activeRouteRenderPromise && activeRouteRenderHash === hash) {
+    reportClientDebug("route-render-reused", { hash });
+    return;
+  }
+  if (state.route === hash && !activeRouteRenderPromise) {
+    const route = parseHashRoute(hash);
+    const matched = route.path.match(/^#\/sessions\/([^/]+)$/);
+    if (!matched || document.querySelector("#session-detail-shell")) {
+      reportClientDebug("route-render-ignored", { hash });
+      return;
+    }
+  }
+
   state.detail.loadRequestId = Number(state.detail.loadRequestId || 0) + 1;
   cleanupSocket();
   cleanupDetailClock();
@@ -4771,7 +5046,6 @@ function renderRoute() {
     state.detail.cachePersistTimerId = 0;
   }
 
-  const hash = window.location.hash || "#/sessions";
   const route = parseHashRoute(hash);
   state.route = hash;
 
@@ -4789,7 +5063,25 @@ function renderRoute() {
     };
   }
 
-  renderWorkspacePage(matched?.[1] || "");
+  const routeSessionId = matched?.[1] || "";
+  activeRouteRenderHash = hash;
+  activeRouteRenderPromise = renderWorkspacePage(routeSessionId)
+    .then(() => {
+      reportClientDebug("route-rendered", { routeSessionId }, { force: true });
+    })
+    .catch((error) => {
+      reportClientDebug(
+        "route-render-error",
+        { routeSessionId, error: serializeClientError(error) },
+        { force: true },
+      );
+    })
+    .finally(() => {
+      if (activeRouteRenderHash === hash) {
+        activeRouteRenderHash = "";
+        activeRouteRenderPromise = null;
+      }
+    });
 }
 
 function getWorkspaceFilteredSessions() {
@@ -4798,6 +5090,14 @@ function getWorkspaceFilteredSessions() {
     matchesSessionFilters(session, projectMap.get(session.projectId), state.sessions),
   );
   return sortSessions(filtered, state.sessions.sort);
+}
+
+function getWorkspaceSessionById(sessionId) {
+  const normalizedSessionId = String(sessionId || "").trim();
+  if (!normalizedSessionId) {
+    return null;
+  }
+  return state.sessions.items.find((session) => session.sessionId === normalizedSessionId) || null;
 }
 
 function resolveWorkspaceSessionId(routeSessionId) {
@@ -4884,10 +5184,7 @@ function getWorkspaceCreateCodexUiOptions() {
 
 function getDefaultCreateSessionCodexLaunch() {
   return normalizeCodexLaunchAgainstUi(
-    {
-      ...loadCodexLaunchPrefs(),
-      ...(state.detail.codexLaunch || {}),
-    },
+    state.detail.codexLaunch || state.detail.session?.codexLaunch || {},
     getWorkspaceCreateCodexUiOptions(),
   );
 }
@@ -4942,8 +5239,8 @@ function renderWorkspaceCreateSessionDialog() {
   const uiOptions = getWorkspaceCreateCodexUiOptions();
   const modelOptions = Array.isArray(uiOptions.models) ? uiOptions.models : [];
   const reasoningOptions = Array.isArray(uiOptions.reasoningLevels) ? uiOptions.reasoningLevels : [];
-  const selectedModelId = String(dialogState.modelId || modelOptions[0]?.id || "").trim();
-  const selectedReasoningId = String(dialogState.reasoningId || "medium").trim();
+  const selectedModelId = String(dialogState.modelId || "").trim();
+  const selectedReasoningId = String(dialogState.reasoningId || "").trim();
   const canSubmitSession = canSubmitWorkspaceCreateSession();
 
   if (dialogState.mode === "pick-project") {
@@ -5018,6 +5315,9 @@ function renderWorkspaceCreateSessionDialog() {
             <label class="workspace-dialog-field">
               <span>${escapeHtml(t("workspace.create.model"))}</span>
               <select id="workspace-create-model" class="workspace-dialog-input">
+                <option value="" ${selectedModelId ? "" : "selected"}>
+                  ${escapeHtml(t("workspace.create.noModelOverride"))}
+                </option>
                 ${modelOptions
                   .map((modelOption) => {
                     const id = String(modelOption.id || "").trim();
@@ -5034,6 +5334,9 @@ function renderWorkspaceCreateSessionDialog() {
             <label class="workspace-dialog-field">
               <span>${escapeHtml(t("workspace.create.reasoning"))}</span>
               <select id="workspace-create-reasoning" class="workspace-dialog-input">
+                <option value="" ${selectedReasoningId ? "" : "selected"}>
+                  ${escapeHtml(t("workspace.create.noReasoningOverride"))}
+                </option>
                 ${reasoningOptions
                   .map((reasoningOption) => {
                     const id = String(reasoningOption.id || "").trim();
@@ -5503,6 +5806,17 @@ function renderWorkspaceSessionTaskIcon(session) {
   `;
 }
 
+function renderWorkspaceSessionPinIcon() {
+  const label = t("workspace.sessionMenu.pinned");
+  return `
+    <span class="workspace-session-pin" title="${escapeHtml(label)}" aria-label="${escapeHtml(label)}">
+      <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+        <path d="M6.2 2.2h3.6l-.5 3.3 2.5 2.3v1.1H8.7v4.2L8 14l-.7-.9V8.9H4.2V7.8l2.5-2.3-.5-3.3z"></path>
+      </svg>
+    </span>
+  `;
+}
+
 function renderCompletionAlertToggle() {
   const prefs = state.workspace.completionAlerts || {};
   const permission = getNotificationPermission();
@@ -5535,6 +5849,7 @@ function renderWorkspaceSidebar(selectedSessionId = "") {
   const projectMap = new Map(state.sessions.projects.map((project) => [project.projectId, project]));
   const filteredSessions = getWorkspaceFilteredSessions();
   const localeOptions = listSupportedLocales();
+  const contextMenuHtml = renderWorkspaceSessionContextMenu();
   const projectOrder = state.sessions.projects
     .map((project) => project.projectId)
     .filter((projectId) => filteredSessions.some((session) => session.projectId === projectId));
@@ -5601,6 +5916,7 @@ function renderWorkspaceSidebar(selectedSessionId = "") {
                           <div class="workspace-session-item-head">
                             <span class="workspace-session-item-title-wrap">
                               <span class="workspace-session-status-dot ${statusClass(displayStatus)}"></span>
+                              ${session.isPinned || session.pinned ? renderWorkspaceSessionPinIcon() : ""}
                               <span class="workspace-session-item-title">${escapeHtml(session.title || t("workspace.session.untitled"))}</span>
                             </span>
                             <span class="workspace-session-item-badges">
@@ -5705,8 +6021,64 @@ function renderWorkspaceSidebar(selectedSessionId = "") {
             : `<div class="workspace-session-empty">${escapeHtml(t("workspace.sidebar.empty"))}</div>`
         }
       </div>
+      ${contextMenuHtml}
     </div>
   `;
+}
+
+function renderWorkspaceSessionContextMenu() {
+  const menu = state.workspace.sessionContextMenu;
+  if (!menu?.sessionId) {
+    return "";
+  }
+  const session = getWorkspaceSessionById(menu.sessionId);
+  if (!session) {
+    return "";
+  }
+  const pinned = Boolean(session.isPinned || session.pinned);
+  const left = Math.max(8, Math.min(Number(menu.x || 0), window.innerWidth - 188));
+  const top = Math.max(8, Math.min(Number(menu.y || 0), window.innerHeight - 150));
+  return `
+    <div class="workspace-session-menu-layer" data-session-menu-action="close">
+      <div
+        class="workspace-session-menu"
+        role="menu"
+        style="left:${left}px;top:${top}px"
+        aria-label="${escapeHtml(t("workspace.sessionMenu.title"))}"
+      >
+        <button type="button" class="workspace-session-menu-item" data-session-menu-action="${pinned ? "unpin" : "pin"}" data-session-menu-id="${escapeHtml(session.sessionId)}" role="menuitem">
+          ${escapeHtml(pinned ? t("workspace.sessionMenu.unpin") : t("workspace.sessionMenu.pin"))}
+        </button>
+        <button type="button" class="workspace-session-menu-item" data-session-menu-action="rename" data-session-menu-id="${escapeHtml(session.sessionId)}" role="menuitem">
+          ${escapeHtml(t("workspace.sessionMenu.rename"))}
+        </button>
+        <button type="button" class="workspace-session-menu-item workspace-session-menu-item-danger" data-session-menu-action="archive" data-session-menu-id="${escapeHtml(session.sessionId)}" role="menuitem">
+          ${escapeHtml(t("workspace.sessionMenu.archive"))}
+        </button>
+      </div>
+    </div>
+  `;
+}
+
+function closeWorkspaceSessionContextMenu() {
+  if (!state.workspace.sessionContextMenu) {
+    return;
+  }
+  state.workspace.sessionContextMenu = null;
+  patchWorkspaceSidebar(state.workspace.activeSessionId || state.detail.session?.sessionId || "");
+}
+
+function openWorkspaceSessionContextMenu(sessionId, clientX, clientY) {
+  const session = getWorkspaceSessionById(sessionId);
+  if (!session) {
+    return;
+  }
+  state.workspace.sessionContextMenu = {
+    sessionId,
+    x: Number(clientX || 0),
+    y: Number(clientY || 0),
+  };
+  patchWorkspaceSidebar(state.workspace.activeSessionId || state.detail.session?.sessionId || "");
 }
 
 function patchWorkspaceSidebar(selectedSessionId = "") {
@@ -5717,6 +6089,102 @@ function patchWorkspaceSidebar(selectedSessionId = "") {
 
   slot.innerHTML = renderWorkspaceSidebar(selectedSessionId);
   bindWorkspaceSidebarControls(selectedSessionId);
+}
+
+async function refreshWorkspaceSessionsNow() {
+  const sessions = await getSessions();
+  if (!sessions || !Array.isArray(sessions.items)) {
+    return [];
+  }
+  state.sessions.items = sessions.items;
+  reconcileWorkspaceReadMarkers(state.sessions.items);
+  return sessions.items;
+}
+
+async function handleWorkspaceSessionMenuAction(action, sessionId) {
+  const normalizedAction = String(action || "").trim();
+  const normalizedSessionId = String(sessionId || "").trim();
+  const session = getWorkspaceSessionById(normalizedSessionId);
+  if (!normalizedAction || !session) {
+    return;
+  }
+
+  closeWorkspaceSessionContextMenu();
+
+  try {
+    if (normalizedAction === "rename") {
+      const nextTitle = window.prompt(t("workspace.sessionMenu.renamePrompt"), session.title || "");
+      if (nextTitle === null) {
+        return;
+      }
+      const trimmedTitle = String(nextTitle || "").trim();
+      if (!trimmedTitle) {
+        showToast(t("workspace.sessionMenu.renameEmpty"));
+        return;
+      }
+      const result = await updateSession(normalizedSessionId, {
+        action: "rename",
+        title: trimmedTitle,
+      });
+      if (result?.session) {
+        updateSessionListItem(result.session);
+        if (state.detail.session?.sessionId === normalizedSessionId) {
+          state.detail.session = {
+            ...state.detail.session,
+            title: result.session.title || trimmedTitle,
+          };
+          scheduleSessionDetailRender();
+        }
+      } else {
+        await refreshWorkspaceSessionsNow();
+      }
+      showToast(t("workspace.sessionMenu.renamed"));
+      patchWorkspaceSidebar(state.workspace.activeSessionId || state.detail.session?.sessionId || "");
+      return;
+    }
+
+    if (normalizedAction === "pin" || normalizedAction === "unpin") {
+      const result = await updateSession(normalizedSessionId, {
+        action: normalizedAction,
+        pinned: normalizedAction === "pin",
+      });
+      const shouldPin = Boolean(result?.pinned ?? normalizedAction === "pin");
+      state.sessions.items = state.sessions.items.map((item) =>
+        item.sessionId === normalizedSessionId
+          ? { ...item, pinned: shouldPin, isPinned: shouldPin, pinnedOrder: shouldPin ? 0 : null }
+          : item,
+      );
+      await refreshWorkspaceSessionsNow().catch(() => null);
+      showToast(shouldPin ? t("workspace.sessionMenu.pinnedDone") : t("workspace.sessionMenu.unpinnedDone"));
+      patchWorkspaceSidebar(state.workspace.activeSessionId || state.detail.session?.sessionId || "");
+      return;
+    }
+
+    if (normalizedAction === "archive") {
+      if (!window.confirm(t("workspace.sessionMenu.archiveConfirm", { title: session.title || "" }))) {
+        return;
+      }
+      await updateSession(normalizedSessionId, { action: "archive" });
+      const nextItems = await refreshWorkspaceSessionsNow();
+      showToast(t("workspace.sessionMenu.archived"));
+      const activeSessionId = state.workspace.activeSessionId || state.detail.session?.sessionId || "";
+      if (activeSessionId === normalizedSessionId) {
+        const nextSessionId = nextItems[0]?.sessionId || "";
+        state.workspace.activeSessionId = nextSessionId;
+        if (nextSessionId) {
+          window.location.hash = buildSessionDetailHash(nextSessionId);
+        } else {
+          window.location.hash = "#/sessions";
+        }
+      } else {
+        patchWorkspaceSidebar(activeSessionId);
+      }
+      return;
+    }
+  } catch (error) {
+    showToast(messageOf(error));
+    await refreshWorkspaceSessionsForSidebar().catch(() => null);
+  }
 }
 
 function cleanupWorkspaceSessionsRefresh() {
@@ -5853,6 +6321,8 @@ function closeWorkspaceCreateDialog() {
   state.workspace.createDialog.startMode = "project";
   state.workspace.createDialog.submitting = false;
   state.workspace.createDialog.selectedProjectId = "";
+  state.workspace.createDialog.firstMessage = "";
+  state.workspace.createDialog.clientCreateId = "";
   state.workspace.createDialog.projectName = "";
   state.workspace.createDialog.projectPath = "";
   state.workspace.createDialog.customCwd = "";
@@ -5881,10 +6351,11 @@ function openWorkspaceCreateSessionDialog() {
   state.workspace.createDialog.submitting = false;
   state.workspace.createDialog.selectedProjectId = preferredProjectId;
   state.workspace.createDialog.firstMessage = "";
+  state.workspace.createDialog.clientCreateId = "";
   state.workspace.createDialog.customCwd =
     prefs.cwd || state.detail.session?.projectPath || preferredProject?.path || "";
   state.workspace.createDialog.modelId = prefs.modelId || defaultLaunch.modelId || "";
-  state.workspace.createDialog.reasoningId = prefs.reasoningId || defaultLaunch.reasoningId || "medium";
+  state.workspace.createDialog.reasoningId = prefs.reasoningId || defaultLaunch.reasoningId || "";
   state.workspace.createDialog.projectName = "";
   state.workspace.createDialog.projectPath = "";
   state.workspace.createDialog.browserLoading = false;
@@ -5897,6 +6368,9 @@ function openWorkspaceCreateSessionDialog() {
 
 async function submitWorkspaceCreateSession() {
   const dialogState = state.workspace.createDialog;
+  if (dialogState.submitting) {
+    return;
+  }
   const startMode = normalizeCreateSessionStartMode(dialogState.startMode);
   const projectId = String(dialogState.selectedProjectId || "").trim();
   const customCwd = String(dialogState.customCwd || "").trim();
@@ -5917,11 +6391,14 @@ async function submitWorkspaceCreateSession() {
 
   state.workspace.createDialog.submitting = true;
   state.workspace.createDialog.error = "";
+  state.workspace.createDialog.clientCreateId =
+    String(state.workspace.createDialog.clientCreateId || "").trim() || createClientMessageId("create");
   patchWorkspaceModalSlot();
 
   try {
     const payload = {
       message,
+      clientCreateId: state.workspace.createDialog.clientCreateId,
       modelId: String(dialogState.modelId || "").trim(),
       reasoningId: String(dialogState.reasoningId || "").trim(),
     };
@@ -5942,6 +6419,7 @@ async function submitWorkspaceCreateSession() {
     );
   } catch (error) {
     state.workspace.createDialog.submitting = false;
+    state.workspace.createDialog.clientCreateId = "";
     state.workspace.createDialog.error = messageOf(error);
     patchWorkspaceModalSlot();
   }
@@ -6506,7 +6984,47 @@ function bindWorkspaceSidebarControls(selectedSessionId = "") {
     if (!(button instanceof HTMLButtonElement)) {
       return;
     }
+    let longPressTimer = 0;
+    let menuOpenedByPress = false;
+    const clearLongPressTimer = () => {
+      if (longPressTimer) {
+        window.clearTimeout(longPressTimer);
+        longPressTimer = 0;
+      }
+    };
+    const openMenu = (event) => {
+      const sessionId = button.getAttribute("data-open-session") || "";
+      if (!sessionId) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      menuOpenedByPress = true;
+      openWorkspaceSessionContextMenu(sessionId, event.clientX, event.clientY);
+    };
+    button.oncontextmenu = openMenu;
+    button.onpointerdown = (event) => {
+      if (event.pointerType === "mouse" || event.button !== 0) {
+        return;
+      }
+      menuOpenedByPress = false;
+      clearLongPressTimer();
+      const clientX = event.clientX;
+      const clientY = event.clientY;
+      longPressTimer = window.setTimeout(() => {
+        longPressTimer = 0;
+        menuOpenedByPress = true;
+        openWorkspaceSessionContextMenu(button.getAttribute("data-open-session") || "", clientX, clientY);
+      }, 560);
+    };
+    button.onpointerup = clearLongPressTimer;
+    button.onpointercancel = clearLongPressTimer;
+    button.onpointerleave = clearLongPressTimer;
     button.onclick = () => {
+      if (menuOpenedByPress) {
+        menuOpenedByPress = false;
+        return;
+      }
       const sessionId = button.getAttribute("data-open-session");
       if (!sessionId || sessionId === selectedSessionId) {
         return;
@@ -6525,9 +7043,60 @@ function bindWorkspaceSidebarControls(selectedSessionId = "") {
       );
     };
   });
+
+  document.querySelectorAll("[data-session-menu-action]").forEach((element) => {
+    if (!(element instanceof HTMLElement)) {
+      return;
+    }
+    element.onclick = (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const action = element.getAttribute("data-session-menu-action") || "";
+      if (action === "close") {
+        closeWorkspaceSessionContextMenu();
+        return;
+      }
+      void handleWorkspaceSessionMenuAction(
+        action,
+        element.getAttribute("data-session-menu-id") || "",
+      );
+    };
+  });
 }
 
-async function renderWorkspacePage(routeSessionId) {
+function renderWorkspacePage(routeSessionId) {
+  const normalizedRouteSessionId = String(routeSessionId || "").trim();
+  if (
+    activeWorkspaceRenderPromise &&
+    activeWorkspaceRenderSessionId === normalizedRouteSessionId
+  ) {
+    reportClientDebug(
+      "workspace-render-reused",
+      { routeSessionId: normalizedRouteSessionId },
+    );
+    return activeWorkspaceRenderPromise;
+  }
+
+  const promise = renderWorkspacePageImpl(normalizedRouteSessionId).finally(() => {
+    if (
+      activeWorkspaceRenderSessionId === normalizedRouteSessionId &&
+      activeWorkspaceRenderPromise === promise
+    ) {
+      activeWorkspaceRenderSessionId = "";
+      activeWorkspaceRenderPromise = null;
+    }
+  });
+  activeWorkspaceRenderSessionId = normalizedRouteSessionId;
+  activeWorkspaceRenderPromise = promise;
+  return promise;
+}
+
+async function renderWorkspacePageImpl(normalizedRouteSessionId) {
+  reportClientDebug(
+    "workspace-render-start",
+    { routeSessionId: normalizedRouteSessionId },
+    { force: true },
+  );
   if (isMobileWorkspaceViewport()) {
     state.workspace.sidebarCollapsed = true;
   }
@@ -6546,7 +7115,7 @@ async function renderWorkspacePage(routeSessionId) {
     state.sessions.projects = projects.items;
     reconcileWorkspaceReadMarkers(state.sessions.items);
 
-    const selectedSessionId = resolveWorkspaceSessionId(routeSessionId);
+    const selectedSessionId = resolveWorkspaceSessionId(normalizedRouteSessionId);
     state.workspace.activeSessionId = selectedSessionId;
     markWorkspaceSessionSeen(selectedSessionId);
 
@@ -6562,7 +7131,17 @@ async function renderWorkspacePage(routeSessionId) {
       return;
     }
 
-    if (routeSessionId !== selectedSessionId) {
+    reportClientDebug(
+      "workspace-session-selected",
+      {
+        routeSessionId: normalizedRouteSessionId,
+        selectedSessionId,
+        sessionCount: state.sessions.items.length,
+      },
+      { force: true },
+    );
+
+    if (normalizedRouteSessionId !== selectedSessionId) {
       const nextHash = buildSessionDetailHash(
         selectedSessionId,
         state.detail.filter,
@@ -6580,8 +7159,33 @@ async function renderWorkspacePage(routeSessionId) {
     }
 
     await renderSessionDetailPage(selectedSessionId);
+    if (
+      !document.querySelector("#session-detail-shell") &&
+      state.workspace.activeSessionId === selectedSessionId
+    ) {
+      reportClientDebug(
+        "workspace-detail-missing-retry",
+        { selectedSessionId },
+        { force: true },
+      );
+      await renderSessionDetailPage(selectedSessionId);
+    }
     patchWorkspaceSidebar(selectedSessionId);
+    reportClientDebug(
+      "workspace-render-complete",
+      {
+        routeSessionId: normalizedRouteSessionId,
+        selectedSessionId,
+        hasDetail: Boolean(document.querySelector("#session-detail-shell")),
+      },
+      { force: true },
+    );
   } catch (error) {
+    reportClientDebug(
+      "workspace-render-error",
+      { routeSessionId: normalizedRouteSessionId, error: serializeClientError(error) },
+      { force: true },
+    );
     app.innerHTML = renderWorkspaceShell({
       sidebarHtml: renderWorkspaceSidebar(""),
       mainHtml: errorCard(messageOf(error)),
@@ -7155,6 +7759,11 @@ async function renderSessionDetailPage(sessionId) {
   if (!normalizedSessionId) {
     return;
   }
+  reportClientDebug(
+    "detail-load-start",
+    { sessionId: normalizedSessionId },
+    { force: true },
+  );
 
   const previousSessionId = String(state.detail.session?.sessionId || "").trim();
   if (previousSessionId !== normalizedSessionId) {
@@ -7206,6 +7815,16 @@ async function renderSessionDetailPage(sessionId) {
   try {
     await syncImportedSession(normalizedSessionId).catch(() => null);
     if (isStaleDetailLoad()) {
+      reportClientDebug(
+        "detail-load-stale-after-sync",
+        {
+          sessionId: normalizedSessionId,
+          activeSessionId: state.workspace.activeSessionId,
+          loadRequestId,
+          currentLoadRequestId: state.detail.loadRequestId,
+        },
+        { force: true },
+      );
       return;
     }
 
@@ -7216,6 +7835,16 @@ async function renderSessionDetailPage(sessionId) {
       getCodexHosts().catch(() => null),
     ]);
     if (isStaleDetailLoad()) {
+      reportClientDebug(
+        "detail-load-stale-after-data",
+        {
+          sessionId: normalizedSessionId,
+          activeSessionId: state.workspace.activeSessionId,
+          loadRequestId,
+          currentLoadRequestId: state.detail.loadRequestId,
+        },
+        { force: true },
+      );
       return;
     }
 
@@ -7227,15 +7856,6 @@ async function renderSessionDetailPage(sessionId) {
       uiOptionsResult.reasoningLevels.length > 0
         ? uiOptionsResult
         : CLIENT_FALLBACK_CODEX_UI_OPTIONS;
-    const codexStatus = await getCodexStatus({
-      sessionId: normalizedSessionId,
-      threadId: session.codexThreadId || "",
-      cwd: session.projectPath || "",
-    }).catch(() => null);
-    if (isStaleDetailLoad()) {
-      return;
-    }
-
     state.detail.session = session;
     replaceDetailTimelineRawEvents(eventData.items);
     markCompletionEventsSeen(eventData.items);
@@ -7258,7 +7878,7 @@ async function renderSessionDetailPage(sessionId) {
     });
     state.detail.codexUiOptions = uiOptions;
     state.detail.codexLaunch = normalizeCodexLaunchAgainstUi(
-      session.codexLaunch || loadCodexLaunchPrefs(),
+      session.codexLaunch || {},
       uiOptions,
     );
     state.detail.remoteHosts =
@@ -7276,7 +7896,7 @@ async function renderSessionDetailPage(sessionId) {
         ? hostsResult.activeHost.trim()
         : (state.detail.remoteHosts[0] || getCurrentPageHost());
     state.detail.codexQuota = readCachedCodexQuota(normalizedSessionId);
-    state.detail.codexStatus = codexStatus;
+    state.detail.codexStatus = null;
     state.detail.completionNoticeArmed = isSessionLiveBusy(session);
     state.detail.detailSyncing = false;
     state.detail.detailSyncError = "";
@@ -7288,11 +7908,66 @@ async function renderSessionDetailPage(sessionId) {
       state.detail.autoScroll = true;
     }
 
+    reportClientDebug(
+      "detail-load-data-ready",
+      {
+        sessionId: normalizedSessionId,
+        rawEventCount: state.detail.timelineState?.rawEvents?.length || 0,
+      },
+      { force: true },
+    );
     renderSessionDetail();
+    reportClientDebug(
+      "detail-rendered",
+      {
+        sessionId: normalizedSessionId,
+        hasDetail: Boolean(document.querySelector("#session-detail-shell")),
+        hasTranscript: Boolean(document.querySelector("#session-transcript-slot")),
+      },
+      { force: true },
+    );
     void maybeFlushMobileSendQueue("detail-load");
     if (isStaleDetailLoad()) {
+      reportClientDebug(
+        "detail-load-stale-after-render",
+        {
+          sessionId: normalizedSessionId,
+          activeSessionId: state.workspace.activeSessionId,
+          loadRequestId,
+          currentLoadRequestId: state.detail.loadRequestId,
+        },
+        { force: true },
+      );
       return;
     }
+
+    void getCodexStatus({
+      sessionId: normalizedSessionId,
+      threadId: session.codexThreadId || "",
+      cwd: session.projectPath || "",
+    })
+      .then((codexStatus) => {
+        if (isStaleDetailLoad()) {
+          return;
+        }
+        state.detail.codexStatus = codexStatus;
+        scheduleSessionDetailRender({ immediate: true });
+        reportClientDebug(
+          "detail-status-loaded",
+          { sessionId: normalizedSessionId },
+          { force: true },
+        );
+      })
+      .catch((error) => {
+        if (isStaleDetailLoad()) {
+          return;
+        }
+        reportClientDebug(
+          "detail-status-error",
+          { sessionId: normalizedSessionId, error: serializeClientError(error) },
+          { force: true },
+        );
+      });
 
     attachSessionSocket(normalizedSessionId);
     void catchUpSessionEvents(normalizedSessionId, state.detail.cursor)
@@ -7305,8 +7980,25 @@ async function renderSessionDetailPage(sessionId) {
     scheduleImportedSessionSync(normalizedSessionId);
   } catch (error) {
     if (isStaleDetailLoad()) {
+      reportClientDebug(
+        "detail-load-error-stale",
+        {
+          sessionId: normalizedSessionId,
+          activeSessionId: state.workspace.activeSessionId,
+          loadRequestId,
+          currentLoadRequestId: state.detail.loadRequestId,
+          error: serializeClientError(error),
+        },
+        { force: true },
+      );
       return;
     }
+
+    reportClientDebug(
+      "detail-load-error",
+      { sessionId: normalizedSessionId, error: serializeClientError(error) },
+      { force: true },
+    );
 
     if (hydratedFromCache && state.detail.session?.sessionId === normalizedSessionId) {
       state.detail.detailSyncing = false;
@@ -7371,7 +8063,7 @@ function renderSessionDetail() {
 
   if (!state.detail.codexLaunch) {
     state.detail.codexLaunch = normalizeCodexLaunchAgainstUi(
-      loadCodexLaunchPrefs(),
+      session.codexLaunch || {},
       state.detail.codexUiOptions,
     );
   }
@@ -7436,9 +8128,7 @@ function renderSessionDetail() {
   const approvalBarHtml = detailSyncing ? "" : renderPendingApprovalBar(state.detail);
   const liveStatusHtml = state.detail.detailSyncError
     ? `<div class="completion-actions-status">${escapeHtml(t("workspace.loading.sessionSyncFailed"))}</div>`
-    : (detailSyncing
-      ? `<div class="completion-actions-status">${escapeHtml(t("workspace.loading.sessionSyncing"))}</div>`
-      : "");
+    : "";
   const completionOptionsHtml = renderCompletionOptionsPanel();
   const completionNoticeHtml = detailSyncing ? "" : renderCompletionNotice();
   const speechControlHtml = renderCompletionSpeechControl();
@@ -7596,7 +8286,14 @@ function renderSessionDetail() {
     approvalSlot.innerHTML = approvalBarHtml;
     state.detail.lastApprovalBarHtml = approvalBarHtml;
   }
-  if (liveStatusSlot && (!shellMounted || state.detail.lastLiveStatusHtml !== liveStatusHtml)) {
+  if (
+    liveStatusSlot &&
+    (
+      !shellMounted ||
+      state.detail.lastLiveStatusHtml !== liveStatusHtml ||
+      liveStatusSlot.innerHTML !== liveStatusHtml
+    )
+  ) {
     liveStatusSlot.innerHTML = liveStatusHtml;
     state.detail.lastLiveStatusHtml = liveStatusHtml;
   }
@@ -7625,6 +8322,7 @@ function renderSessionDetail() {
   const composerTextarea = document.querySelector('textarea[name="content"]');
   const messageFormEl = document.querySelector("#message-form");
   const composerActionFab = document.querySelector("#composer-action");
+  const composerSteerFab = document.querySelector("#composer-steer-action");
   const composerStopFab = document.querySelector("#composer-stop-action");
   const composerAttachFab = document.querySelector("#composer-attach-action");
   const composerAttachmentInput = document.querySelector("#composer-attachment-input");
@@ -7650,8 +8348,16 @@ function renderSessionDetail() {
     } else {
       composerActionFab.disabled =
         state.detail.composerUploadingAttachments || (!composerTextarea.value.trim() && !hasAttachments);
-      composerActionFab.setAttribute("aria-label", t("composer.aria.send"));
-      composerActionFab.setAttribute("title", t("composer.aria.send"));
+      composerActionFab.setAttribute("aria-label", currentBusy ? t("composer.aria.queue") : t("composer.aria.send"));
+      composerActionFab.setAttribute("title", currentBusy ? t("composer.aria.queue") : t("composer.aria.send"));
+    }
+    if (composerSteerFab instanceof HTMLButtonElement) {
+      composerSteerFab.disabled =
+        detailSyncing ||
+        state.detail.composerSending ||
+        state.detail.composerUploadingAttachments ||
+        !currentBusy ||
+        (!composerTextarea.value.trim() && !hasAttachments);
     }
     if (composerStopFab instanceof HTMLButtonElement) {
       composerStopFab.disabled =
@@ -7678,11 +8384,13 @@ function renderSessionDetail() {
     if (composerSendStatus instanceof HTMLElement) {
       const queuedStatus = getMobileQueueStatusText(session.sessionId);
       state.detail.mobileQueueStatusText = queuedStatus;
-      const placeholderHint = getComposerPlaceholderHint(session, {
-        attachmentStatusText,
-        queuedStatus,
-        currentBusy,
-      });
+      const placeholderHint = detailSyncing
+        ? t("composer.syncingHint")
+        : getComposerPlaceholderHint(session, {
+          attachmentStatusText,
+          queuedStatus,
+          currentBusy,
+        });
       state.detail.composerPlaceholderHint = placeholderHint;
       composerTextarea.placeholder = placeholderHint || t("composer.placeholder");
       composerTextarea.classList.toggle(
@@ -7742,10 +8450,26 @@ function renderSessionDetail() {
       return;
     }
 
-    if (shouldHoldMobileMessageForQueue()) {
-      queueMobileComposerMessage(session.sessionId, content, payload);
-      clearComposerAttachments();
-      if (composerTextarea) {
+    const busyBeforeRefresh = isSessionLiveBusy(state.detail.session);
+    const busyAfterRefresh = await refreshSessionBeforeSend();
+    const shouldQueueAfterRefresh = Boolean(busyAfterRefresh && !state.detail.mobileQueueSending);
+    reportClientDebug(
+      "composer-submit-route",
+      {
+        sessionId: session.sessionId,
+        busyBeforeRefresh,
+        busyAfterRefresh,
+        detailSyncing: Boolean(state.detail.detailSyncing),
+        composerSending: Boolean(state.detail.composerSending),
+        mobileQueueSending: Boolean(state.detail.mobileQueueSending),
+        route: shouldQueueAfterRefresh ? "queue" : "messages",
+      },
+      { force: true },
+    );
+
+    if (shouldQueueAfterRefresh) {
+      const queued = await queueOfficialComposerMessage(session.sessionId, content, payload);
+      if (queued && composerTextarea) {
         composerTextarea.value = "";
         adjustComposerHeight(composerTextarea);
       }
@@ -7847,11 +8571,7 @@ function renderSessionDetail() {
     }
   }
 
-  async function refreshBusySessionBeforeSend() {
-    if (!isSessionLiveBusy(state.detail.session)) {
-      return false;
-    }
-
+  async function refreshSessionBeforeSend() {
     await resumeActiveSessionDetail("pre-send");
     return isSessionLiveBusy(state.detail.session);
   }
@@ -7900,6 +8620,45 @@ function renderSessionDetail() {
     };
   }
 
+  if (composerSteerFab) {
+    composerSteerFab.onclick = async () => {
+      if (state.detail.detailSyncing || state.detail.composerSending) {
+        return;
+      }
+      const content = String(composerTextarea?.value || "").trim();
+      const attachmentPayloads = getComposerAttachmentPayloads();
+      if (!content && attachmentPayloads.length <= 0) {
+        return;
+      }
+      if (!isSessionLiveBusy(state.detail.session)) {
+        showToast(t("composer.steerNeedsBusy"));
+        return;
+      }
+      if (state.detail.composerUploadingAttachments) {
+        showToast(t("composer.attachments.uploading"));
+        return;
+      }
+      if ((state.detail.composerAttachments || []).some((item) => item.status !== "ready")) {
+        showToast(t("composer.attachments.failed"));
+        return;
+      }
+      const codex = buildCodexLaunchPayload(
+        state.detail.codexLaunch,
+        state.detail.codexUiOptions,
+      );
+      const payload = ensurePayloadClientMessageId({
+        content,
+        ...(codex ? { codex } : {}),
+        ...(attachmentPayloads.length ? { attachments: attachmentPayloads } : {}),
+      }, "steer");
+      const sent = await steerComposerMessage(session.sessionId, content, payload);
+      if (sent && composerTextarea) {
+        composerTextarea.value = "";
+        adjustComposerHeight(composerTextarea);
+      }
+    };
+  }
+
   if (composerAttachFab instanceof HTMLButtonElement && composerAttachmentInput instanceof HTMLInputElement) {
     composerAttachFab.onclick = () => {
       composerAttachmentInput.click();
@@ -7918,7 +8677,7 @@ function renderSessionDetail() {
     });
   });
 
-  document.querySelectorAll("[data-mobile-queue-item]").forEach((itemEl) => {
+  document.querySelectorAll("[data-mobile-queue-item], [data-official-queue-item]").forEach((itemEl) => {
     const toggleMenu = () => {
       document.querySelectorAll(".session-queue-item-menu-open").forEach((openItem) => {
         if (openItem !== itemEl) {
@@ -7928,7 +8687,10 @@ function renderSessionDetail() {
       itemEl.classList.toggle("session-queue-item-menu-open");
     };
     itemEl.addEventListener("click", (event) => {
-      if (event.target instanceof HTMLElement && event.target.closest("[data-mobile-queue-action]")) {
+      if (
+        event.target instanceof HTMLElement &&
+        event.target.closest("[data-mobile-queue-action], [data-official-queue-action]")
+      ) {
         return;
       }
       event.preventDefault();
@@ -7940,6 +8702,43 @@ function renderSessionDetail() {
       }
       event.preventDefault();
       toggleMenu();
+    });
+  });
+
+  document.querySelectorAll("[data-official-queue-action]").forEach((button) => {
+    button.addEventListener("click", async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      const itemId = button.getAttribute("data-official-queue-id") || "";
+      const action = button.getAttribute("data-official-queue-action") || "";
+      const queuedItem = getOfficialQueuedMessages(session).find((item) => String(item?.id || "") === itemId);
+      if (!queuedItem || state.detail.composerSending) {
+        return;
+      }
+      try {
+        let result = null;
+        if (action === "edit") {
+          const nextContent = window.prompt(t("queue.editPrompt"), queuedItem.text || "");
+          if (nextContent === null) {
+            return;
+          }
+          result = await updateQueuedMessage(session.sessionId, itemId, { content: nextContent });
+          showToast(t("queue.edited"));
+        } else if (action === "remove") {
+          result = await deleteQueuedMessage(session.sessionId, itemId);
+          showToast(t("queue.removed"));
+        } else if (action === "front") {
+          result = await updateQueuedMessage(session.sessionId, itemId, { action: "front" });
+          showToast(t("queue.movedToFront"));
+        }
+        if (result) {
+          applyOfficialQueueResult(result, session);
+          scheduleSessionDetailRender();
+        }
+      } catch (error) {
+        showToast(messageOf(error));
+        void refreshOfficialQueueForSession(session.sessionId).catch(() => null);
+      }
     });
   });
 
@@ -7988,7 +8787,7 @@ function renderSessionDetail() {
       if (!window.confirm(t("composer.stopConfirm"))) {
         return;
       }
-      const stillBusy = await refreshBusySessionBeforeSend();
+      const stillBusy = await refreshSessionBeforeSend();
       if (stillBusy) {
         state.detail.composerStopping = true;
         syncComposerActionState();
@@ -8681,7 +9480,6 @@ function getSelectedModelLabel(uiOptions, launch, threadInfo) {
   return (
     threadInfo?.model ||
     opts.models.find((item) => item.id === launch?.modelId)?.label ||
-    opts.models[0]?.label ||
     t("session.model.unsynced")
   );
 }
@@ -11681,6 +12479,19 @@ function sortSessions(sessions, sort) {
   const items = [...sessions];
 
   items.sort((left, right) => {
+    const leftPinned = Boolean(left.isPinned || left.pinned);
+    const rightPinned = Boolean(right.isPinned || right.pinned);
+    if (leftPinned !== rightPinned) {
+      return Number(rightPinned) - Number(leftPinned);
+    }
+    if (leftPinned && rightPinned) {
+      const leftOrder = Number.isFinite(Number(left.pinnedOrder)) ? Number(left.pinnedOrder) : 9999;
+      const rightOrder = Number.isFinite(Number(right.pinnedOrder)) ? Number(right.pinnedOrder) : 9999;
+      if (leftOrder !== rightOrder) {
+        return leftOrder - rightOrder;
+      }
+    }
+
     if (sort === "created_desc") {
       return compareTimes(right.createdAt, left.createdAt) || compareTitles(left, right);
     }

@@ -238,7 +238,7 @@ def set_run_at_startup(enabled: bool) -> None:
 
 
 def bridge_main(argv: list[str]) -> int:
-    os.environ.setdefault("SYNCODEX_BUNDLE_ROOT", str(bundle_root()))
+    os.environ["SYNCODEX_BUNDLE_ROOT"] = str(bundle_root())
     from syncodex_server import main
 
     old_argv = sys.argv[:]

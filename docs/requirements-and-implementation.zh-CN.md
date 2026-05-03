@@ -17,6 +17,33 @@ Syncodex 是一个运行在 Windows 本机的官方 Codex 同步桥接工具。
 3. Syncodex 的发送链路优先走官方桌面 IPC
 4. 手机端体验可以增强，但不能牺牲同步准确性
 
+## 2026-04-29 实现更新：手机详情首屏、缓存与兼容性
+
+本轮把手机端详情页加载链路进一步稳定化，尤其针对长会话、running 会话和公网隧道访问。
+
+实现要点：
+
+- 前端发布入口改为 `/app.bundle.js`，由 `scripts\build_web_bundle.ps1` 使用 esbuild 生成；`scripts\build_tray.ps1` 会在 PyInstaller 打包前自动构建 bundle。
+- `index.html` 保留轻量 polyfill，覆盖部分手机浏览器缺少的 `String.prototype.replaceAll`、`Array.prototype.at`、`crypto.randomUUID`。
+- 新增 `/api/client-debug`，前端在 boot error、空白页 watchdog、详情加载和详情恢复时上报诊断，后端写入 access log。
+- 详情首屏只等待最新一页 timeline，不再同步阻塞式回填多页历史；更早历史继续走懒加载。
+- 路由和 workspace 渲染对同一 hash/session 做 in-flight 复用，避免重复刷新同一 session 时互相判 stale。
+- 如果 workspace shell 已经出现但 `#session-detail-shell` 没有挂载，会自动重试详情渲染一次。
+- 手机公网 token 首次访问先写长期 cookie 再跳转到无 token 地址，避免 token HTML 与后续静态资源请求之间出现授权竞态。
+
+缓存原则保持不变：
+
+```text
+只缓存内容，不缓存真相
+```
+
+具体表现：
+
+- 命中缓存时先显示缓存内容，`detailSyncing=true`。
+- 同步中禁用发送、停止和附件按钮，输入框显示“正在同步最新状态，请稍候...”。
+- 真实数据同步成功后才清除 `detailSyncing`，输入框回到“空闲中，等待输入”。
+- 底部不再显示正常同步中的绿色小字，只保留同步失败等需要用户处理的提示。
+
 ## 2. 主要需求
 
 ### 2.1 基础同步

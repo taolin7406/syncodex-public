@@ -3,8 +3,52 @@ const headers = {
 };
 
 const SEND_MESSAGE_TIMEOUT_MS = 75_000;
+const GET_RETRY_DELAYS_MS = [350, 900];
+const ATTACHMENT_UPLOAD_RETRY_DELAYS_MS = [700, 1600];
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    window.setTimeout(resolve, ms);
+  });
+}
+
+function isTransientFetchError(error) {
+  return (
+    error?.name === "TypeError" &&
+    String(error?.message || "").toLowerCase().includes("failed to fetch")
+  );
+}
+
+function isTransientRequestError(error) {
+  return isTransientFetchError(error) || error?.code === "request_timeout";
+}
+
+function shouldRetryRequest(options, error, attempt, retryDelaysMs) {
+  const method = String(options.method || "GET").toUpperCase();
+  const delays = Array.isArray(retryDelaysMs) ? retryDelaysMs : method === "GET" ? GET_RETRY_DELAYS_MS : [];
+  return attempt < delays.length && isTransientRequestError(error);
+}
 
 async function request(path, options = {}) {
+  const { timeoutMs = 0, retryDelaysMs = null, ...fetchOptions } = options;
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await requestOnce(path, { timeoutMs, ...fetchOptions });
+    } catch (error) {
+      const delays = Array.isArray(retryDelaysMs)
+        ? retryDelaysMs
+        : String(fetchOptions.method || "GET").toUpperCase() === "GET"
+          ? GET_RETRY_DELAYS_MS
+          : [];
+      if (!shouldRetryRequest(fetchOptions, error, attempt, delays)) {
+        throw error;
+      }
+      await sleep(delays[attempt]);
+    }
+  }
+}
+
+async function requestOnce(path, options = {}) {
   const { timeoutMs = 0, ...fetchOptions } = options;
   const controller =
     timeoutMs > 0 && typeof AbortController !== "undefined"
@@ -113,6 +157,13 @@ export function getSession(sessionId) {
   return request(`/api/sessions/${sessionId}`);
 }
 
+export function updateSession(sessionId, payload) {
+  return request(`/api/sessions/${sessionId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+}
+
 export function syncImportedSession(sessionId) {
   return request(`/api/sessions/${sessionId}/sync`, {
     method: "POST",
@@ -177,9 +228,53 @@ export function sendMessage(sessionId, payload) {
   }).then(assertMessageSent);
 }
 
+export function getSessionQueue(sessionId) {
+  return request(`/api/sessions/${sessionId}/queue`);
+}
+
+export function queueMessage(sessionId, payload) {
+  return request(`/api/sessions/${sessionId}/queue`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+  }).then(assertMessageSent);
+}
+
+export function steerMessage(sessionId, payload) {
+  return request(`/api/sessions/${sessionId}/steer`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+    timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+  }).then(assertMessageSent);
+}
+
+export function updateQueuedMessage(sessionId, itemId, payload) {
+  return request(`/api/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+    timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+  }).then(assertMessageSent);
+}
+
+export function deleteQueuedMessage(sessionId, itemId) {
+  return request(`/api/sessions/${sessionId}/queue/${encodeURIComponent(itemId)}`, {
+    method: "DELETE",
+    timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+  }).then(assertMessageSent);
+}
+
 export function uploadSessionAttachments(sessionId, attachments) {
   return request(`/api/sessions/${sessionId}/attachments`, {
     method: "POST",
+    body: JSON.stringify({ attachments }),
+    timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
+    retryDelaysMs: ATTACHMENT_UPLOAD_RETRY_DELAYS_MS,
+  });
+}
+
+export function deleteSessionAttachments(sessionId, attachments) {
+  return request(`/api/sessions/${sessionId}/attachments`, {
+    method: "DELETE",
     body: JSON.stringify({ attachments }),
     timeoutMs: SEND_MESSAGE_TIMEOUT_MS,
   });

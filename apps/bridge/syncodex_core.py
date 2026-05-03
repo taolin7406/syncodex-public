@@ -15,6 +15,7 @@ import shutil
 import hashlib
 import mimetypes
 import tempfile
+from contextlib import closing
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,11 +28,40 @@ DEFAULT_GLOBAL_STATE = DEFAULT_CODEX_HOME / ".codex-global-state.json"
 MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024
 MAX_ATTACHMENT_TOTAL_BYTES = 60 * 1024 * 1024
 MAX_ATTACHMENT_COUNT = 8
+ATTACHMENT_MANIFEST_NAME = ".syncodex-attachments.json"
 MAX_TTS_TEXT_CHARS = 8000
 MIN_TTS_AUDIO_BYTES = 1024
 TTS_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 SEND_CLIENT_DEDUPE_SECONDS = 10 * 60
 SEND_CONTENT_DEDUPE_SECONDS = 8
+CREATE_CLIENT_DEDUPE_SECONDS = 10 * 60
+CREATE_CONTENT_DEDUPE_SECONDS = 120
+
+
+def syncodex_runtime_root() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(os.environ.get("SYNCODEX_BUNDLE_ROOT") or Path(__file__).resolve().parents[2])
+
+
+def syncodex_data_root() -> Path:
+    configured = str(os.environ.get("SYNCODEX_DATA_DIR") or "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    local_app_data = str(os.environ.get("LOCALAPPDATA") or "").strip()
+    if local_app_data:
+        return Path(local_app_data) / "Syncodex"
+    return syncodex_runtime_root()
+
+
+def append_syncodex_runtime_log(name: str, message: str) -> None:
+    try:
+        path = syncodex_runtime_root() / name
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(f"[{timestamp}] {message.rstrip()}\n")
+    except Exception:
+        pass
 
 
 class SyncodexError(Exception):
@@ -387,6 +417,7 @@ class CodexStateReader:
         self.global_state = codex_home / ".codex-global-state.json"
         self.session_index = codex_home / "session_index.jsonl"
         self.sessions_dir = codex_home / "sessions"
+        self.archived_sessions_dir = codex_home / "archived_sessions"
 
     def health(self) -> dict[str, Any]:
         return {
@@ -400,6 +431,8 @@ class CodexStateReader:
             "session_index_exists": self.session_index.exists(),
             "sessions_dir": str(self.sessions_dir),
             "sessions_dir_exists": self.sessions_dir.exists(),
+            "archived_sessions_dir": str(self.archived_sessions_dir),
+            "archived_sessions_dir_exists": self.archived_sessions_dir.exists(),
         }
 
     def _connect(self) -> sqlite3.Connection:
@@ -425,10 +458,18 @@ class CodexStateReader:
         detail = f": {last_error}" if last_error else ""
         raise SyncodexError(f"Unable to open Codex state database {db_path}{detail}")
 
+    def _connect_write(self) -> sqlite3.Connection:
+        if not self.state_db.exists():
+            raise SyncodexError(f"Codex state database not found: {self.state_db}")
+        conn = sqlite3.connect(str(self.state_db), timeout=5.0)
+        conn.row_factory = sqlite3.Row
+        return conn
+
     def list_threads(self, limit: int = 200) -> list[ThreadRecord]:
         display_names = self._read_session_index_names()
+        archived_thread_ids = self._read_archived_thread_ids()
         try:
-            with self._connect() as conn:
+            with closing(self._connect()) as conn:
                 rows = conn.execute(
                     """
                     select id, title, cwd, rollout_path, created_at, updated_at, source,
@@ -436,6 +477,7 @@ class CodexStateReader:
                     from threads
                     where archived = 0
                       and id not in (select child_thread_id from thread_spawn_edges)
+                      and source != 'exec'
                       and source not like '%"subagent"%'
                       and source not like '%thread_spawn%'
                     order by updated_at desc
@@ -447,14 +489,131 @@ class CodexStateReader:
             rows = []
         threads = [self._row_to_thread(row, display_names) for row in rows]
         thread_ids = {thread.id for thread in threads}
-        threads.extend(self._list_rollout_threads(display_names, thread_ids, limit))
+        threads.extend(self._list_rollout_threads(display_names, thread_ids | archived_thread_ids, limit))
         threads.sort(key=lambda thread: thread.updated_at, reverse=True)
         return threads[:limit]
+
+    def read_pinned_thread_ids(self) -> list[str]:
+        state = self._read_global_state()
+        value = state.get("pinned-thread-ids")
+        if not isinstance(value, list):
+            return []
+        items: list[str] = []
+        for item in value:
+            thread_id = str(item or "").strip()
+            if thread_id and thread_id not in items:
+                items.append(thread_id)
+        return items
+
+    def set_thread_pinned(self, thread_id: str, pinned: bool) -> list[str]:
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_thread_id:
+            raise SyncodexError("Thread id is required.")
+        self.get_thread(normalized_thread_id)
+
+        state = self._read_global_state()
+        pinned_ids = [
+            item
+            for item in self.read_pinned_thread_ids()
+            if item != normalized_thread_id
+        ]
+        if pinned:
+            pinned_ids.insert(0, normalized_thread_id)
+        state["pinned-thread-ids"] = pinned_ids
+        self._write_global_state(state)
+        return pinned_ids
+
+    def rename_thread(self, thread_id: str, title: str) -> ThreadRecord:
+        normalized_thread_id = str(thread_id or "").strip()
+        next_title = repair_mojibake_text(str(title or "").strip())
+        if not normalized_thread_id:
+            raise SyncodexError("Thread id is required.")
+        if not next_title:
+            raise SyncodexError("Thread title is required.")
+        self.get_thread(normalized_thread_id)
+
+        now_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        item = {
+            "id": normalized_thread_id,
+            "thread_name": next_title,
+            "updated_at": now_iso,
+        }
+        try:
+            with self.session_index.open("a", encoding="utf-8", newline="\n") as handle:
+                handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+        except OSError as exc:
+            raise SyncodexError(f"Unable to update Codex session index: {exc}") from exc
+
+        try:
+            with closing(self._connect_write()) as conn:
+                conn.execute(
+                    "update threads set title = ? where id = ?",
+                    (next_title, normalized_thread_id),
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise SyncodexError(f"Unable to update Codex thread title: {exc}") from exc
+
+        return self.get_thread(normalized_thread_id)
+
+    def archive_thread(self, thread_id: str) -> dict[str, Any]:
+        normalized_thread_id = str(thread_id or "").strip()
+        if not normalized_thread_id:
+            raise SyncodexError("Thread id is required.")
+        thread = self.get_thread(normalized_thread_id)
+
+        moved_to = ""
+        move_error = ""
+        source_path = Path(normalize_windows_path(thread.rollout_path))
+        if source_path.exists() and source_path.is_file():
+            try:
+                self.archived_sessions_dir.mkdir(parents=True, exist_ok=True)
+                destination = self.archived_sessions_dir / source_path.name
+                if destination.exists():
+                    stem = source_path.stem
+                    suffix = source_path.suffix
+                    for index in range(1, 1000):
+                        candidate = self.archived_sessions_dir / f"{stem}-{index}{suffix}"
+                        if not candidate.exists():
+                            destination = candidate
+                            break
+                shutil.move(str(source_path), str(destination))
+                moved_to = str(destination)
+            except OSError as exc:
+                move_error = str(exc)
+
+        now = int(time.time())
+        rollout_path = moved_to or thread.rollout_path
+        try:
+            with closing(self._connect_write()) as conn:
+                conn.execute(
+                    """
+                    update threads
+                    set archived = 1,
+                        archived_at = ?,
+                        rollout_path = ?
+                    where id = ?
+                    """,
+                    (now, rollout_path, normalized_thread_id),
+                )
+                conn.commit()
+        except sqlite3.Error as exc:
+            raise SyncodexError(f"Unable to archive Codex thread: {exc}") from exc
+
+        self.set_thread_pinned(normalized_thread_id, False)
+        return {
+            "ok": True,
+            "sessionId": normalized_thread_id,
+            "threadId": normalized_thread_id,
+            "archived": True,
+            "rolloutPath": rollout_path,
+            "moveError": move_error,
+        }
 
     def get_thread(self, thread_id: str) -> ThreadRecord:
         display_names = self._read_session_index_names()
         try:
-            with self._connect() as conn:
+            with closing(self._connect()) as conn:
                 row = conn.execute(
                     """
                     select id, title, cwd, rollout_path, created_at, updated_at, source,
@@ -494,7 +653,7 @@ class CodexStateReader:
             thread = self._thread_from_rollout_path(path, display_names)
             if not thread or thread.id in exclude_ids:
                 continue
-            if "subagent" in thread.source.lower() or "thread_spawn" in thread.source.lower():
+            if self._is_hidden_thread_source(thread.source):
                 continue
             threads.append(thread)
         return threads
@@ -586,6 +745,34 @@ class CodexStateReader:
             return content_to_text(payload.get("content")), False
         return "", False
 
+    def _is_hidden_thread_source(self, source: str) -> bool:
+        normalized = str(source or "").strip().lower()
+        return (
+            normalized == "exec"
+            or "subagent" in normalized
+            or "thread_spawn" in normalized
+        )
+
+    def _read_archived_thread_ids(self) -> set[str]:
+        archived_ids: set[str] = set()
+        try:
+            with closing(self._connect()) as conn:
+                rows = conn.execute("select id from threads where archived != 0").fetchall()
+                archived_ids.update(str(row["id"] or "").strip() for row in rows)
+        except SyncodexError:
+            pass
+
+        if self.archived_sessions_dir.exists():
+            try:
+                for path in self.archived_sessions_dir.rglob("rollout-*.jsonl"):
+                    thread_id = rollout_thread_id_from_path(path)
+                    if thread_id:
+                        archived_ids.add(thread_id)
+            except OSError:
+                pass
+
+        return {thread_id for thread_id in archived_ids if thread_id}
+
     def _read_session_index_names(self) -> dict[str, str]:
         display_names: dict[str, str] = {}
         if not self.session_index.exists():
@@ -630,18 +817,7 @@ class CodexStateReader:
         )
 
     def read_queued_followups(self) -> dict[str, list[dict[str, Any]]]:
-        if not self.global_state.exists():
-            return {}
-
-        try:
-            with self.global_state.open("r", encoding="utf-8", errors="replace") as handle:
-                state = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            return {}
-
-        source = state.get("queued-follow-ups")
-        if not isinstance(source, dict):
-            return {}
+        source = self.read_queued_followups_state()
 
         queues: dict[str, list[dict[str, Any]]] = {}
         for thread_id, raw_items in source.items():
@@ -661,6 +837,72 @@ class CodexStateReader:
                 queues[normalized_thread_id] = items
 
         return queues
+
+    def read_queued_followups_state(self) -> dict[str, list[dict[str, Any]]]:
+        if not self.global_state.exists():
+            return {}
+
+        try:
+            with self.global_state.open("r", encoding="utf-8", errors="replace") as handle:
+                state = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        source = state.get("queued-follow-ups")
+        if not isinstance(source, dict):
+            return {}
+
+        queues: dict[str, list[dict[str, Any]]] = {}
+        for thread_id, raw_items in source.items():
+            normalized_thread_id = str(thread_id or "").strip()
+            if not normalized_thread_id or not isinstance(raw_items, list):
+                continue
+            normalized_items = [dict(item) for item in raw_items if isinstance(item, dict)]
+            if normalized_items:
+                queues[normalized_thread_id] = normalized_items
+        return queues
+
+    def write_queued_followups_state(self, queues: dict[str, list[dict[str, Any]]]) -> None:
+        state = self._read_global_state()
+        normalized: dict[str, list[dict[str, Any]]] = {}
+        for thread_id, raw_items in queues.items():
+            normalized_thread_id = str(thread_id or "").strip()
+            if not normalized_thread_id or not isinstance(raw_items, list):
+                continue
+            items = [dict(item) for item in raw_items if isinstance(item, dict)]
+            if items:
+                normalized[normalized_thread_id] = items
+        if normalized:
+            state["queued-follow-ups"] = normalized
+        else:
+            state.pop("queued-follow-ups", None)
+        self._write_global_state(state)
+
+    def _read_global_state(self) -> dict[str, Any]:
+        if not self.global_state.exists():
+            return {}
+
+        try:
+            with self.global_state.open("r", encoding="utf-8", errors="replace") as handle:
+                state = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        return state if isinstance(state, dict) else {}
+
+    def _write_global_state(self, state: dict[str, Any]) -> None:
+        self.global_state.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = self.global_state.with_name(f"{self.global_state.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+        try:
+            with temp_path.open("w", encoding="utf-8", newline="\n") as handle:
+                json.dump(state, handle, ensure_ascii=False, separators=(",", ":"))
+            os.replace(temp_path, self.global_state)
+        except OSError as exc:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise SyncodexError(f"Unable to update Codex global state: {exc}") from exc
 
     def queued_followups_for_thread(self, thread_id: str) -> list[dict[str, Any]]:
         normalized_thread_id = str(thread_id or "").strip()
@@ -710,6 +952,7 @@ class CodexStateReader:
                 for root in workspace_roots
                 if str(root or "").strip()
             ],
+            "pausedReason": str(item.get("pausedReason") or "").strip(),
         }
 
 
@@ -1153,6 +1396,9 @@ class ThreadMessageSender:
         self.ipc_script_path = ipc_script_path or root / "scripts" / "codex_send_thread_message_ipc.js"
         self.interrupt_script_path = root / "scripts" / "codex_interrupt_thread_ipc.js"
         self.create_script_path = root / "scripts" / "codex_create_thread_app_server.js"
+        self.queue_script_path = root / "scripts" / "codex_set_queued_followups_ipc.js"
+        self.steer_script_path = root / "scripts" / "codex_steer_thread_ipc.js"
+        self.archive_broadcast_script_path = root / "scripts" / "codex_broadcast_thread_archived_ipc.js"
 
     def send(
         self,
@@ -1276,6 +1522,108 @@ class ThreadMessageSender:
             "error": sender_payload.get("error") or (completed.stderr[-4000:] if status == "failed" else ""),
         }
 
+    def update_queued_followups_state(
+        self,
+        thread: ThreadRecord,
+        state: dict[str, list[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        script_path = self.queue_script_path
+        if not script_path.exists():
+            return {
+                "thread_id": thread.id,
+                "threadId": thread.id,
+                "status": "failed",
+                "error": f"Queue IPC script is not implemented yet: {script_path}",
+            }
+
+        temp_path = ""
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                suffix=".json",
+                prefix="syncodex-queued-followups-",
+                delete=False,
+            ) as handle:
+                json.dump(state, handle, ensure_ascii=False, separators=(",", ":"))
+                temp_path = handle.name
+
+            command = [
+                "node",
+                str(script_path),
+                "--thread-id",
+                thread.id,
+                "--state-json-file",
+                temp_path,
+                "--timeout-ms",
+                "30000",
+            ]
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            completed = subprocess.run(
+                command,
+                cwd=normalize_windows_path(thread.cwd) or None,
+                text=True,
+                capture_output=True,
+                timeout=35,
+                check=False,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            return {
+                "thread_id": thread.id,
+                "threadId": thread.id,
+                "status": "failed",
+                "error": str(exc),
+            }
+        finally:
+            if temp_path:
+                try:
+                    Path(temp_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+        sender_payload = parse_sender_stdout(completed.stdout)
+        status = "updated" if completed.returncode == 0 else "failed"
+        return {
+            "thread_id": thread.id,
+            "threadId": thread.id,
+            "status": status,
+            "deliveryMode": sender_payload.get("deliveryMode") or script_path.stem,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+            **sender_payload,
+            "error": sender_payload.get("error") or (completed.stderr[-4000:] if status == "failed" else ""),
+        }
+
+    def steer(
+        self,
+        thread: ThreadRecord,
+        message: str,
+        *,
+        client_message_id: str = "",
+    ) -> dict[str, Any]:
+        message = message.strip()
+        if not message:
+            raise SyncodexError("Message cannot be empty.")
+        client_message_id = normalize_client_message_id(client_message_id) or str(uuid.uuid4())
+
+        result = self._run_sender(
+            self.steer_script_path,
+            thread,
+            message,
+            timeout_seconds=45,
+            extra_args=["--cwd", normalize_windows_path(thread.cwd)] if thread.cwd else [],
+        )
+        return {
+            "client_message_id": client_message_id,
+            "clientMessageId": client_message_id,
+            "eventId": client_message_id,
+            "desktopRefreshRequired": False,
+            "desktopSynchronized": result.get("status") != "failed",
+            **result,
+        }
+
     def create_thread(
         self,
         seed_thread: ThreadRecord | None,
@@ -1379,6 +1727,62 @@ class ThreadMessageSender:
             "stderr": "",
             "backgroundPid": proc.pid,
             **sender_payload,
+        }
+
+    def broadcast_thread_archived(self, thread: ThreadRecord) -> dict[str, Any]:
+        script_path = self.archive_broadcast_script_path
+        if not script_path.exists():
+            return {
+                "thread_id": thread.id,
+                "threadId": thread.id,
+                "status": "failed",
+                "error": f"Archive broadcast script is missing: {script_path}",
+            }
+
+        command = [
+            "node",
+            str(script_path),
+            "--thread-id",
+            thread.id,
+            "--host-id",
+            "local",
+            "--timeout-ms",
+            "8000",
+        ]
+        if thread.cwd:
+            command.extend(["--cwd", normalize_windows_path(thread.cwd)])
+
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+            completed = subprocess.run(
+                command,
+                cwd=normalize_windows_path(thread.cwd) or None,
+                text=True,
+                capture_output=True,
+                timeout=10,
+                check=False,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            return {
+                "thread_id": thread.id,
+                "threadId": thread.id,
+                "status": "failed",
+                "error": str(exc),
+            }
+
+        sender_payload = parse_sender_stdout(completed.stdout)
+        status = "broadcast" if completed.returncode == 0 else "failed"
+        return {
+            "thread_id": thread.id,
+            "threadId": thread.id,
+            "status": status,
+            "deliveryMode": sender_payload.get("deliveryMode") or script_path.stem,
+            "returncode": completed.returncode,
+            "stdout": completed.stdout[-4000:],
+            "stderr": completed.stderr[-4000:],
+            **sender_payload,
+            "error": sender_payload.get("error") or (completed.stderr[-4000:] if status == "failed" else ""),
         }
 
     def _safe_ipc_fallback_reason(self, ipc_result: dict[str, Any]) -> str:
@@ -1569,7 +1973,11 @@ class SyncodexCore:
         self._recent_send_lock = threading.RLock()
         self._recent_sends: dict[str, dict[str, Any]] = {}
         self._recent_send_locks: dict[str, threading.Lock] = {}
+        self._recent_create_lock = threading.RLock()
+        self._recent_creates: dict[str, dict[str, Any]] = {}
+        self._recent_create_locks: dict[str, threading.Lock] = {}
         self._forced_idle_sessions: dict[str, dict[str, Any]] = {}
+        self._official_queue_lock = threading.RLock()
         self._tts_lock = threading.RLock()
         self._tts_generation_locks: dict[str, threading.Lock] = {}
 
@@ -1579,6 +1987,14 @@ class SyncodexCore:
             if lock is None:
                 lock = threading.Lock()
                 self._recent_send_locks[dedupe_key] = lock
+            return lock
+
+    def _create_dedupe_lock(self, dedupe_key: str) -> threading.Lock:
+        with self._recent_create_lock:
+            lock = self._recent_create_locks.get(dedupe_key)
+            if lock is None:
+                lock = threading.Lock()
+                self._recent_create_locks[dedupe_key] = lock
             return lock
 
     def _log_send_event(self, event: str, **fields: Any) -> None:
@@ -1591,6 +2007,17 @@ class SyncodexCore:
             print("[syncodex-send] " + json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
         except Exception:
             print(f"[syncodex-send] {event} {fields}", flush=True)
+
+    def _log_create_event(self, event: str, **fields: Any) -> None:
+        payload = {
+            "event": event,
+            "ts": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            **fields,
+        }
+        try:
+            print("[syncodex-create] " + json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
+        except Exception:
+            print(f"[syncodex-create] {event} {fields}", flush=True)
 
     def _find_recent_send(
         self,
@@ -1623,6 +2050,39 @@ class SyncodexCore:
                 "createdAt": now,
                 "result": dict(result),
             }
+
+    def _find_recent_create(
+        self,
+        keys: list[tuple[str, str, int]],
+        now: float,
+    ) -> dict[str, Any] | None:
+        for kind, key, ttl_seconds in keys:
+            recent = self._recent_creates.get(key)
+            if not recent:
+                continue
+            recent_ttl = int(recent.get("ttlSeconds") or ttl_seconds)
+            if now - float(recent.get("createdAt", 0)) < recent_ttl:
+                result = dict(recent.get("result") or {})
+                result["deduplicated"] = True
+                result["dedupeKind"] = kind
+                return result
+        return None
+
+    def _remember_recent_create(
+        self,
+        keys: list[tuple[str, str, int]],
+        result: dict[str, Any],
+    ) -> None:
+        now = time.time()
+        for kind, key, ttl_seconds in keys:
+            self._recent_creates[key] = {
+                "kind": kind,
+                "ttlSeconds": ttl_seconds,
+                "createdAt": now,
+                "result": dict(result),
+            }
+        for _kind, key, _ttl_seconds in keys:
+            self._recent_create_locks.pop(key, None)
 
     def _iter_tts_dirs(self) -> list[Path]:
         roots: list[Path] = []
@@ -1868,6 +2328,91 @@ class SyncodexCore:
 
         return resolved
 
+    def _attachment_upload_root(self, thread_id: str) -> Path:
+        configured_root = str(os.environ.get("SYNCODEX_UPLOAD_DIR") or "").strip()
+        base = Path(configured_root).expanduser() if configured_root else self.reader.codex_home / "syncodex_uploads"
+        return base / thread_id
+
+    def _attachment_upload_fallback_root(self, thread_id: str) -> Path:
+        configured_root = str(os.environ.get("SYNCODEX_UPLOAD_DIR") or "").strip()
+        if configured_root:
+            return self._attachment_upload_root(thread_id)
+        return syncodex_data_root() / "uploads" / thread_id
+
+    def _attachment_allowed_roots(self, thread_id: str) -> list[Path]:
+        roots = [self._attachment_upload_root(thread_id), self._attachment_upload_fallback_root(thread_id)]
+        allowed: list[Path] = []
+        seen: set[str] = set()
+        for root in roots:
+            try:
+                resolved = root.resolve()
+            except OSError:
+                resolved = root.absolute()
+            key = str(resolved).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            allowed.append(resolved)
+        return allowed
+
+    def _attachment_manifest_path(self, upload_root: Path) -> Path:
+        return upload_root / ATTACHMENT_MANIFEST_NAME
+
+    def _read_attachment_manifest(self, upload_root: Path) -> dict[str, dict[str, Any]]:
+        try:
+            raw = json.loads(self._attachment_manifest_path(upload_root).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        if not isinstance(raw, dict):
+            return {}
+        records = raw.get("attachments") if isinstance(raw.get("attachments"), dict) else raw
+        if not isinstance(records, dict):
+            return {}
+        return {str(key): value for key, value in records.items() if isinstance(value, dict)}
+
+    def _write_attachment_manifest(self, upload_root: Path, records: dict[str, dict[str, Any]]) -> None:
+        data = {
+            "version": 1,
+            "updatedAt": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+            "attachments": records,
+        }
+        try:
+            self._attachment_manifest_path(upload_root).write_text(
+                json.dumps(data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            append_syncodex_runtime_log(
+                ".syncodex-bridge.err.log",
+                f"Failed to write attachment manifest: {self._attachment_manifest_path(upload_root)}",
+            )
+
+    def _manifest_attachment_record(self, upload_root: Path, attachment_id: str) -> dict[str, Any] | None:
+        if not attachment_id:
+            return None
+        record = self._read_attachment_manifest(upload_root).get(attachment_id)
+        if not isinstance(record, dict):
+            return None
+        raw_path = str(record.get("path") or "").strip()
+        if not raw_path:
+            return None
+        try:
+            target = Path(normalize_windows_path(raw_path)).expanduser().resolve(strict=False)
+            root = upload_root.resolve()
+        except OSError:
+            return None
+        if root not in target.parents or not target.is_file():
+            return None
+        mime_type = str(record.get("mimeType") or record.get("type") or mimetypes.guess_type(target.name)[0] or "")
+        return {
+            "id": attachment_id,
+            "name": str(record.get("name") or target.name),
+            "mimeType": mime_type,
+            "size": int(record.get("size") or target.stat().st_size),
+            "path": str(target),
+            "isImage": bool(record.get("isImage")) or mime_type.startswith("image/"),
+        }
+
     def save_attachments(self, session_id: str, attachments: list[dict[str, Any]]) -> dict[str, Any]:
         thread = self.reader.get_thread(session_id)
         if not isinstance(attachments, list):
@@ -1875,15 +2420,28 @@ class SyncodexCore:
         if len(attachments) > MAX_ATTACHMENT_COUNT:
             raise SyncodexError(f"Too many attachments. Maximum is {MAX_ATTACHMENT_COUNT}.")
 
-        upload_root = self.reader.codex_home / "syncodex_uploads" / thread.id
-        upload_root.mkdir(parents=True, exist_ok=True)
+        upload_root = self._attachment_upload_root(thread.id)
+        try:
+            upload_root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            upload_root = self._attachment_upload_fallback_root(thread.id)
+            upload_root.mkdir(parents=True, exist_ok=True)
 
         saved: list[dict[str, Any]] = []
         total_bytes = 0
         stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime())
+        manifest = self._read_attachment_manifest(upload_root)
+        manifest_changed = False
         for index, item in enumerate(attachments, start=1):
             if not isinstance(item, dict):
                 continue
+            attachment_id = str(item.get("id") or "").strip()
+            if attachment_id:
+                existing = self._manifest_attachment_record(upload_root, attachment_id)
+                if existing:
+                    total_bytes += int(existing.get("size") or 0)
+                    saved.append(existing)
+                    continue
             name = safe_attachment_name(str(item.get("name") or f"attachment-{index}"))
             mime_type = str(item.get("mimeType") or item.get("type") or mimetypes.guess_type(name)[0] or "").strip()
             data = decode_attachment_data(str(item.get("data") or item.get("base64") or ""))
@@ -1899,20 +2457,109 @@ class SyncodexCore:
             target = (upload_root / target_name).resolve()
             if upload_root.resolve() not in target.parents:
                 raise SyncodexError("Invalid attachment path.")
-            target.write_bytes(data)
+            try:
+                target.write_bytes(data)
+            except OSError:
+                fallback_root = self._attachment_upload_fallback_root(thread.id)
+                if fallback_root.resolve() == upload_root.resolve():
+                    raise
+                fallback_root.mkdir(parents=True, exist_ok=True)
+                upload_root = fallback_root
+                manifest = self._read_attachment_manifest(upload_root)
+                target = (upload_root / target_name).resolve()
+                if upload_root.resolve() not in target.parents:
+                    raise SyncodexError("Invalid attachment path.")
+                target.write_bytes(data)
             path = str(target)
-            saved.append(
-                {
-                    "id": str(item.get("id") or uuid.uuid4()),
-                    "name": name,
-                    "mimeType": mime_type,
-                    "size": len(data),
-                    "path": path,
-                    "isImage": mime_type.startswith("image/"),
-                }
-            )
+            record = {
+                "id": attachment_id or str(uuid.uuid4()),
+                "name": name,
+                "mimeType": mime_type,
+                "size": len(data),
+                "path": path,
+                "isImage": mime_type.startswith("image/"),
+            }
+            manifest[str(record["id"])] = record
+            manifest_changed = True
+            saved.append(record)
+
+        if manifest_changed:
+            self._write_attachment_manifest(upload_root, manifest)
 
         return {"items": saved, "attachments": saved, "count": len(saved)}
+
+    def delete_attachments(self, session_id: str, attachments: list[dict[str, Any] | str]) -> dict[str, Any]:
+        thread = self.reader.get_thread(session_id)
+        if not isinstance(attachments, list):
+            raise SyncodexError("Attachments must be a list.")
+
+        upload_roots = self._attachment_allowed_roots(thread.id)
+        deleted: list[str] = []
+        skipped: list[str] = []
+        errors: list[dict[str, str]] = []
+        manifest_records_by_root: dict[str, dict[str, dict[str, Any]]] = {}
+        manifests_changed: set[str] = set()
+
+        for item in attachments:
+            if isinstance(item, dict):
+                raw_path = str(item.get("path") or "").strip()
+            else:
+                raw_path = str(item or "").strip()
+            if not raw_path:
+                skipped.append("")
+                continue
+
+            candidate = Path(normalize_windows_path(raw_path)).expanduser()
+            try:
+                target = candidate.resolve(strict=False)
+            except OSError as exc:
+                errors.append({"path": raw_path, "error": str(exc)})
+                continue
+
+            if not any(root in target.parents and target != root for root in upload_roots):
+                skipped.append(raw_path)
+                continue
+            if not target.exists():
+                skipped.append(str(target))
+                continue
+            if not target.is_file():
+                skipped.append(str(target))
+                continue
+
+            try:
+                target.unlink()
+                deleted.append(str(target))
+                for root in upload_roots:
+                    root_key = str(root)
+                    records = manifest_records_by_root.get(root_key)
+                    if records is None:
+                        records = self._read_attachment_manifest(root)
+                        manifest_records_by_root[root_key] = records
+                    before_count = len(records)
+                    records = {
+                        key: value
+                        for key, value in records.items()
+                        if str(value.get("path") or "") != str(target)
+                    }
+                    if len(records) != before_count:
+                        manifest_records_by_root[root_key] = records
+                        manifests_changed.add(root_key)
+            except OSError as exc:
+                errors.append({"path": str(target), "error": str(exc)})
+
+        for root in upload_roots:
+            root_key = str(root)
+            if root_key in manifests_changed:
+                self._write_attachment_manifest(root, manifest_records_by_root.get(root_key, {}))
+
+        return {
+            "ok": not errors,
+            "deleted": deleted,
+            "deletedCount": len(deleted),
+            "skipped": skipped,
+            "skippedCount": len(skipped),
+            "errors": errors,
+        }
 
     def health(self) -> dict[str, Any]:
         state = self.reader.health()
@@ -1925,6 +2572,9 @@ class SyncodexCore:
                     state["sessions_dir_exists"],
                     sender_script.exists(),
                     self.sender.create_script_path.exists(),
+                    self.sender.queue_script_path.exists(),
+                    self.sender.steer_script_path.exists(),
+                    self.sender.archive_broadcast_script_path.exists(),
                     shutil.which("node") is not None,
                     shutil.which("codex") is not None,
                 ]
@@ -1940,6 +2590,12 @@ class SyncodexCore:
             "desktop_ipc_sender_script_exists": self.sender.ipc_script_path.exists(),
             "desktop_ipc_interrupt_script": str(self.sender.interrupt_script_path),
             "desktop_ipc_interrupt_script_exists": self.sender.interrupt_script_path.exists(),
+            "desktop_ipc_queue_script": str(self.sender.queue_script_path),
+            "desktop_ipc_queue_script_exists": self.sender.queue_script_path.exists(),
+            "desktop_ipc_steer_script": str(self.sender.steer_script_path),
+            "desktop_ipc_steer_script_exists": self.sender.steer_script_path.exists(),
+            "desktop_ipc_archive_broadcast_script": str(self.sender.archive_broadcast_script_path),
+            "desktop_ipc_archive_broadcast_script_exists": self.sender.archive_broadcast_script_path.exists(),
             "create_thread_script": str(self.sender.create_script_path),
             "create_thread_script_exists": self.sender.create_script_path.exists(),
             **state,
@@ -1948,8 +2604,11 @@ class SyncodexCore:
     def list_sessions(self) -> dict[str, Any]:
         sessions: list[dict[str, Any]] = []
         official_queues = self.reader.read_queued_followups()
+        pinned_thread_ids = self.reader.read_pinned_thread_ids()
+        pinned_order = {thread_id: index for index, thread_id in enumerate(pinned_thread_ids)}
         for thread in self.reader.list_threads():
             session = thread.to_session()
+            self._attach_pinned_state(session, pinned_order)
             session.update(self.parser.summarize_thread(thread))
             session = self._attach_official_queue(session, official_queues, include_items=False)
             session = self._apply_forced_idle(session)
@@ -1967,6 +2626,7 @@ class SyncodexCore:
                 continue
 
             session = thread.to_session()
+            self._attach_pinned_state(session, pinned_order)
             session.update(self.parser.summarize_thread(thread))
             session = self._attach_official_queue(session, official_queues, include_items=False)
             session = self._apply_forced_idle(session)
@@ -1974,6 +2634,67 @@ class SyncodexCore:
             self.pending_created_sessions.pop(session_id, None)
 
         return {"sessions": sessions, "items": sessions, "count": len(sessions)}
+
+    def _attach_pinned_state(self, session: dict[str, Any], pinned_order: dict[str, int]) -> None:
+        session_id = str(session.get("sessionId") or session.get("id") or "").strip()
+        if session_id in pinned_order:
+            session["pinned"] = True
+            session["isPinned"] = True
+            session["pinnedOrder"] = pinned_order[session_id]
+        else:
+            session["pinned"] = False
+            session["isPinned"] = False
+            session["pinnedOrder"] = None
+
+    def update_session_metadata(
+        self,
+        session_id: str,
+        *,
+        action: str = "",
+        title: str = "",
+        pinned: bool | None = None,
+    ) -> dict[str, Any]:
+        normalized_session_id = str(session_id or "").strip()
+        normalized_action = str(action or "").strip().lower()
+        if not normalized_session_id:
+            raise SyncodexError("Session id is required.")
+
+        if normalized_action == "rename":
+            thread = self.reader.rename_thread(normalized_session_id, title)
+            session = thread.to_session()
+            pinned_order = {
+                thread_id: index
+                for index, thread_id in enumerate(self.reader.read_pinned_thread_ids())
+            }
+            self._attach_pinned_state(session, pinned_order)
+            session.update(self.parser.summarize_thread(thread))
+            session = self._attach_official_queue(
+                session,
+                self.reader.read_queued_followups(),
+                include_items=True,
+            )
+            return {"ok": True, "action": normalized_action, "session": session}
+
+        if normalized_action in {"pin", "unpin"}:
+            should_pin = normalized_action == "pin" if pinned is None else bool(pinned)
+            pinned_ids = self.reader.set_thread_pinned(normalized_session_id, should_pin)
+            return {
+                "ok": True,
+                "action": "pin" if should_pin else "unpin",
+                "sessionId": normalized_session_id,
+                "threadId": normalized_session_id,
+                "pinned": should_pin,
+                "pinnedThreadIds": pinned_ids,
+            }
+
+        if normalized_action == "archive":
+            thread = self.reader.get_thread(normalized_session_id)
+            result = self.reader.archive_thread(normalized_session_id)
+            result["desktopBroadcast"] = self.sender.broadcast_thread_archived(thread)
+            result["action"] = normalized_action
+            return result
+
+        raise SyncodexError(f"Unsupported session action: {normalized_action or action}")
 
     def list_projects(self) -> dict[str, Any]:
         projects: dict[str, dict[str, Any]] = {}
@@ -2014,8 +2735,10 @@ class SyncodexCore:
         cwd: str = "",
         model: str = "",
         reasoning_effort: str = "",
+        client_create_id: str = "",
     ) -> dict[str, Any]:
         project_id = str(project_id or "").strip()
+        client_create_id = normalize_client_message_id(client_create_id)
         target_cwd = normalize_windows_path(cwd)
         seed_thread: ThreadRecord | None = None
         if project_id:
@@ -2035,66 +2758,138 @@ class SyncodexCore:
             reasoning_effort or (seed_thread.reasoning_effort if seed_thread else "") or ""
         ).strip()
 
-        result = self.sender.create_thread(
-            seed_thread,
-            message,
-            cwd=effective_cwd,
-            model=effective_model,
-            reasoning_effort=effective_reasoning_effort,
-        )
-        if result.get("returncode") not in (None, 0) or not result.get("threadId"):
-            error = result.get("error") or result.get("stderr") or "Codex app-server failed to create a thread."
-            raise SyncodexError(str(error).strip())
+        normalized_message = normalize_message_text(message)
+        create_hash = hashlib.sha256(
+            f"{effective_cwd}\0{effective_model}\0{effective_reasoning_effort}\0{normalized_message}".encode(
+                "utf-8",
+                errors="replace",
+            )
+        ).hexdigest()
+        dedupe_keys: list[tuple[str, str, int]] = []
+        if client_create_id:
+            client_dedupe_key = hashlib.sha256(
+                f"client\0{client_create_id}".encode("utf-8", errors="replace")
+            ).hexdigest()
+            dedupe_keys.append(("clientCreateId", client_dedupe_key, CREATE_CLIENT_DEDUPE_SECONDS))
+        dedupe_keys.append(("content", create_hash, CREATE_CONTENT_DEDUPE_SECONDS))
+        lock_key = dedupe_keys[0][1]
 
-        thread_id = str(result.get("threadId") or result.get("thread_id") or "").strip()
-        deadline = time.time() + 10
-        last_error: Exception | None = None
-        while time.time() < deadline:
-            try:
-                session = self.get_session(thread_id)
-                session.update(
-                    {
-                        "createdBySyncodex": True,
-                        "createResult": {
-                            "turnId": result.get("turnId"),
-                            "deliveryMode": result.get("deliveryMode"),
-                            "elapsedMs": result.get("elapsedMs"),
-                        },
-                    }
+        now = time.time()
+        with self._recent_create_lock:
+            self._recent_creates = {
+                key: value
+                for key, value in self._recent_creates.items()
+                if now - float(value.get("createdAt", 0)) < int(value.get("ttlSeconds") or 30)
+            }
+            result = self._find_recent_create(dedupe_keys, now)
+            if result:
+                self._log_create_event(
+                    "deduplicated",
+                    clientCreateId=client_create_id,
+                    dedupeKind=result.get("dedupeKind"),
+                    contentHash=create_hash[:12],
+                    sessionId=result.get("sessionId") or result.get("id") or "",
                 )
-                return session
-            except Exception as exc:
-                last_error = exc
-                time.sleep(0.25)
+                return result
 
-        pending_session = {
-            "id": thread_id,
-            "session_id": thread_id,
-            "sessionId": thread_id,
-            "thread_id": thread_id,
-            "threadId": thread_id,
-            "codexThreadId": thread_id,
-            "title": derive_session_title_from_message(message),
-            "name": derive_session_title_from_message(message),
-            "cwd": effective_cwd,
-            "workspace": effective_cwd,
-            "projectId": project_id_for_path(effective_cwd),
-            "projectPath": effective_cwd,
-            "status": "running",
-            "liveBusy": True,
-            "source": "official_codex_thread",
-            "sourceKind": "official_codex_thread",
-            "model": effective_model,
-            "reasoning_effort": effective_reasoning_effort,
-            "reasoningEffort": effective_reasoning_effort,
-            "createdBySyncodex": True,
-            "pendingOfficialCreation": True,
-            "pendingUserMessage": message,
-            "createResult": result,
-            "warning": str(last_error) if last_error else "Created thread is not visible in state database yet.",
-        }
-        self.pending_created_sessions[thread_id] = pending_session
-        return dict(pending_session)
+        self._log_create_event(
+            "received",
+            clientCreateId=client_create_id,
+            contentHash=create_hash[:12],
+            cwd=effective_cwd,
+        )
+
+        create_lock = self._create_dedupe_lock(lock_key)
+        if not create_lock.acquire(blocking=False):
+            acquired_after_wait = create_lock.acquire(timeout=45)
+            if acquired_after_wait:
+                create_lock.release()
+            now = time.time()
+            with self._recent_create_lock:
+                result = self._find_recent_create(dedupe_keys, now)
+                if result:
+                    self._log_create_event(
+                        "deduplicated_after_wait",
+                        clientCreateId=client_create_id,
+                        dedupeKind=result.get("dedupeKind"),
+                        contentHash=create_hash[:12],
+                        sessionId=result.get("sessionId") or result.get("id") or "",
+                    )
+                    return result
+            self._log_create_event(
+                "deduplicated_inflight",
+                clientCreateId=client_create_id,
+                contentHash=create_hash[:12],
+            )
+            raise SyncodexError("A matching session creation is already in progress.")
+
+        try:
+            result = self.sender.create_thread(
+                seed_thread,
+                message,
+                cwd=effective_cwd,
+                model=effective_model,
+                reasoning_effort=effective_reasoning_effort,
+            )
+            if result.get("returncode") not in (None, 0) or not result.get("threadId"):
+                error = result.get("error") or result.get("stderr") or "Codex app-server failed to create a thread."
+                raise SyncodexError(str(error).strip())
+
+            thread_id = str(result.get("threadId") or result.get("thread_id") or "").strip()
+            deadline = time.time() + 10
+            last_error: Exception | None = None
+            while time.time() < deadline:
+                try:
+                    session = self.get_session(thread_id)
+                    session.update(
+                        {
+                            "createdBySyncodex": True,
+                            "createResult": {
+                                "turnId": result.get("turnId"),
+                                "deliveryMode": result.get("deliveryMode"),
+                                "elapsedMs": result.get("elapsedMs"),
+                            },
+                        }
+                    )
+                    with self._recent_create_lock:
+                        self._remember_recent_create(dedupe_keys, session)
+                    return session
+                except Exception as exc:
+                    last_error = exc
+                    time.sleep(0.25)
+
+            pending_session = {
+                "id": thread_id,
+                "session_id": thread_id,
+                "sessionId": thread_id,
+                "thread_id": thread_id,
+                "threadId": thread_id,
+                "codexThreadId": thread_id,
+                "title": derive_session_title_from_message(message),
+                "name": derive_session_title_from_message(message),
+                "cwd": effective_cwd,
+                "workspace": effective_cwd,
+                "projectId": project_id_for_path(effective_cwd),
+                "projectPath": effective_cwd,
+                "status": "running",
+                "liveBusy": True,
+                "source": "official_codex_thread",
+                "sourceKind": "official_codex_thread",
+                "model": effective_model,
+                "reasoning_effort": effective_reasoning_effort,
+                "reasoningEffort": effective_reasoning_effort,
+                "createdBySyncodex": True,
+                "pendingOfficialCreation": True,
+                "pendingUserMessage": message,
+                "createResult": result,
+                "warning": str(last_error) if last_error else "Created thread is not visible in state database yet.",
+            }
+            self.pending_created_sessions[thread_id] = pending_session
+            with self._recent_create_lock:
+                self._remember_recent_create(dedupe_keys, pending_session)
+            return dict(pending_session)
+        finally:
+            create_lock.release()
 
     def get_session(self, session_id: str) -> dict[str, Any]:
         try:
@@ -2106,6 +2901,11 @@ class SyncodexCore:
             raise
 
         session = thread.to_session()
+        pinned_order = {
+            thread_id: index
+            for index, thread_id in enumerate(self.reader.read_pinned_thread_ids())
+        }
+        self._attach_pinned_state(session, pinned_order)
         session.update(self.parser.summarize_thread(thread))
         session = self._attach_official_queue(session, include_items=True)
         session = self._apply_forced_idle(session)
@@ -2120,6 +2920,311 @@ class SyncodexCore:
             "appendedEvents": 0,
             "sessionId": session.get("sessionId") or session_id,
             "sourceKind": session.get("sourceKind") or session.get("source") or "official_codex_thread",
+        }
+
+    def get_official_queue(self, session_id: str) -> dict[str, Any]:
+        thread = self.reader.get_thread(session_id)
+        items = self.reader.queued_followups_for_thread(thread.id)
+        return {
+            "ok": True,
+            "sessionId": thread.id,
+            "threadId": thread.id,
+            "items": items,
+            "count": len(items),
+            "officialQueueCount": len(items),
+        }
+
+    def enqueue_official_followup(
+        self,
+        session_id: str,
+        message: str,
+        attachments: list[dict[str, Any]] | None = None,
+        client_message_id: str = "",
+    ) -> dict[str, Any]:
+        thread = self.reader.get_thread(session_id)
+        normalized_message = self._message_with_attachments(message, attachments)
+        if not normalized_message:
+            raise SyncodexError("Message cannot be empty.")
+
+        item = self._build_official_queue_item(thread, normalized_message, client_message_id)
+        append_syncodex_runtime_log(
+            ".syncodex-bridge.log",
+            f"[official-queue] enqueue requested thread={thread.id} item={item['id']} bytes={len(normalized_message.encode('utf-8', errors='replace'))}",
+        )
+        with self._official_queue_lock:
+            state = self.reader.read_queued_followups_state()
+            current = list(state.get(thread.id, []))
+            if any(str(existing.get("id") or "") == item["id"] for existing in current):
+                append_syncodex_runtime_log(
+                    ".syncodex-bridge.log",
+                    f"[official-queue] enqueue deduplicated thread={thread.id} item={item['id']}",
+                )
+                return self._official_queue_response(thread, "queued", {"deduplicated": True})
+            state[thread.id] = [*current, item]
+            update_result = self.sender.update_queued_followups_state(thread, state)
+            if update_result.get("status") == "failed":
+                fallback_reason = self.sender._safe_ipc_fallback_reason(update_result)
+                if fallback_reason:
+                    self.reader.write_queued_followups_state(state)
+                    append_syncodex_runtime_log(
+                        ".syncodex-bridge.log",
+                        f"[official-queue] enqueue saved to global state after IPC miss thread={thread.id} item={item['id']} reason={fallback_reason}",
+                    )
+                    return self._official_queue_response(
+                        thread,
+                        "queued",
+                        {
+                            "queuedItemId": item["id"],
+                            "queueResult": update_result,
+                            "desktopSynchronized": False,
+                            "desktopRefreshRequired": True,
+                            "warning": fallback_reason,
+                        },
+                    )
+                append_syncodex_runtime_log(
+                    ".syncodex-bridge.err.log",
+                    f"[official-queue] enqueue failed thread={thread.id} item={item['id']} error={update_result.get('error') or update_result.get('stderr') or ''}",
+                )
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "threadId": thread.id,
+                    "sessionId": thread.id,
+                    "error": update_result.get("error") or "Codex desktop did not accept the queued follow-up.",
+                    "queueResult": update_result,
+                }
+            append_syncodex_runtime_log(
+                ".syncodex-bridge.log",
+                f"[official-queue] enqueue accepted thread={thread.id} item={item['id']} before={len(current)} after={len(current) + 1}",
+            )
+            return self._official_queue_response(thread, "queued", {"queuedItemId": item["id"], "queueResult": update_result})
+
+    def update_official_followup(
+        self,
+        session_id: str,
+        item_id: str,
+        message: str = "",
+        action: str = "",
+    ) -> dict[str, Any]:
+        thread = self.reader.get_thread(session_id)
+        normalized_item_id = str(item_id or "").strip()
+        if not normalized_item_id:
+            raise SyncodexError("Queue item id is required.")
+
+        with self._official_queue_lock:
+            state = self.reader.read_queued_followups_state()
+            items = list(state.get(thread.id, []))
+            index = next((idx for idx, item in enumerate(items) if str(item.get("id") or "") == normalized_item_id), -1)
+            if index < 0:
+                return self._official_queue_not_found(thread, normalized_item_id)
+
+            if action == "front":
+                if index > 0:
+                    item = items.pop(index)
+                    items.insert(0, item)
+            else:
+                next_message = str(message or "").strip()
+                if not next_message:
+                    raise SyncodexError("Message cannot be empty.")
+                item = dict(items[index])
+                context = item.get("context") if isinstance(item.get("context"), dict) else {}
+                context = {**context, "prompt": next_message}
+                item["text"] = next_message
+                item["context"] = context
+                items[index] = item
+
+            if items:
+                state[thread.id] = items
+            else:
+                state.pop(thread.id, None)
+            update_result = self.sender.update_queued_followups_state(thread, state)
+            if update_result.get("status") == "failed":
+                fallback_reason = self.sender._safe_ipc_fallback_reason(update_result)
+                if fallback_reason:
+                    self.reader.write_queued_followups_state(state)
+                    append_syncodex_runtime_log(
+                        ".syncodex-bridge.log",
+                        f"[official-queue] update saved to global state after IPC miss thread={thread.id} item={normalized_item_id} action={action or 'edit'} reason={fallback_reason}",
+                    )
+                    return self._official_queue_response(
+                        thread,
+                        "updated",
+                        {
+                            "queueResult": update_result,
+                            "desktopSynchronized": False,
+                            "desktopRefreshRequired": True,
+                            "warning": fallback_reason,
+                        },
+                    )
+                append_syncodex_runtime_log(
+                    ".syncodex-bridge.err.log",
+                    f"[official-queue] update failed thread={thread.id} item={normalized_item_id} action={action or 'edit'} error={update_result.get('error') or update_result.get('stderr') or ''}",
+                )
+                return self._official_queue_update_failed(thread, update_result)
+            append_syncodex_runtime_log(
+                ".syncodex-bridge.log",
+                f"[official-queue] update accepted thread={thread.id} item={normalized_item_id} action={action or 'edit'} count={len(items)}",
+            )
+            return self._official_queue_response(thread, "updated", {"queueResult": update_result})
+
+    def delete_official_followup(self, session_id: str, item_id: str) -> dict[str, Any]:
+        thread = self.reader.get_thread(session_id)
+        normalized_item_id = str(item_id or "").strip()
+        if not normalized_item_id:
+            raise SyncodexError("Queue item id is required.")
+
+        with self._official_queue_lock:
+            state = self.reader.read_queued_followups_state()
+            items = list(state.get(thread.id, []))
+            next_items = [item for item in items if str(item.get("id") or "") != normalized_item_id]
+            if len(next_items) == len(items):
+                return self._official_queue_not_found(thread, normalized_item_id)
+            if next_items:
+                state[thread.id] = next_items
+            else:
+                state.pop(thread.id, None)
+            update_result = self.sender.update_queued_followups_state(thread, state)
+            if update_result.get("status") == "failed":
+                fallback_reason = self.sender._safe_ipc_fallback_reason(update_result)
+                if fallback_reason:
+                    self.reader.write_queued_followups_state(state)
+                    append_syncodex_runtime_log(
+                        ".syncodex-bridge.log",
+                        f"[official-queue] delete saved to global state after IPC miss thread={thread.id} item={normalized_item_id} reason={fallback_reason}",
+                    )
+                    return self._official_queue_response(
+                        thread,
+                        "deleted",
+                        {
+                            "queueResult": update_result,
+                            "desktopSynchronized": False,
+                            "desktopRefreshRequired": True,
+                            "warning": fallback_reason,
+                        },
+                    )
+                append_syncodex_runtime_log(
+                    ".syncodex-bridge.err.log",
+                    f"[official-queue] delete failed thread={thread.id} item={normalized_item_id} error={update_result.get('error') or update_result.get('stderr') or ''}",
+                )
+                return self._official_queue_update_failed(thread, update_result)
+            append_syncodex_runtime_log(
+                ".syncodex-bridge.log",
+                f"[official-queue] delete accepted thread={thread.id} item={normalized_item_id} count={len(next_items)}",
+            )
+            return self._official_queue_response(thread, "deleted", {"queueResult": update_result})
+
+    def steer_message(
+        self,
+        session_id: str,
+        message: str,
+        attachments: list[dict[str, Any]] | None = None,
+        client_message_id: str = "",
+    ) -> dict[str, Any]:
+        thread = self.reader.get_thread(session_id)
+        normalized_message = self._message_with_attachments(message, attachments)
+        result = self.sender.steer(thread, normalized_message, client_message_id=client_message_id)
+        if result.get("status") == "failed":
+            append_syncodex_runtime_log(
+                ".syncodex-bridge.err.log",
+                f"[official-steer] failed thread={thread.id} error={result.get('error') or result.get('stderr') or ''}",
+            )
+            return result
+        append_syncodex_runtime_log(
+            ".syncodex-bridge.log",
+            f"[official-steer] accepted thread={thread.id} turn={result.get('turnId') or result.get('turn_id') or ''}",
+        )
+        return {
+            **result,
+            "ok": True,
+            "status": result.get("status") or "steered",
+            "threadId": thread.id,
+            "sessionId": thread.id,
+        }
+
+    def _message_with_attachments(
+        self,
+        message: str,
+        attachments: list[dict[str, Any]] | None = None,
+    ) -> str:
+        normalized_message = str(message or "").strip()
+        normalized_attachments = [
+            item
+            for item in (normalize_attachment_record(item) for item in (attachments or []))
+            if item
+        ]
+        if normalized_attachments:
+            normalized_message = f"{normalized_message}{build_attachment_message_suffix(normalized_attachments)}".strip()
+        return normalized_message
+
+    def _build_official_queue_item(
+        self,
+        thread: ThreadRecord,
+        message: str,
+        client_message_id: str = "",
+    ) -> dict[str, Any]:
+        item_id = normalize_client_message_id(client_message_id) or str(uuid.uuid4())
+        cwd = normalize_windows_path(thread.cwd)
+        workspace_roots = [cwd] if cwd else []
+        return {
+            "id": item_id,
+            "text": message,
+            "context": {
+                "prompt": message,
+                "addedFiles": [],
+                "fileAttachments": [],
+                "ideContext": None,
+                "imageAttachments": [],
+                "workspaceRoots": workspace_roots,
+            },
+            "cwd": cwd,
+            "createdAt": utc_ms(),
+        }
+
+    def _official_queue_response(
+        self,
+        thread: ThreadRecord,
+        status: str,
+        extra: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        items: list[dict[str, Any]] = []
+        for _ in range(4):
+            time.sleep(0.08)
+            items = self.reader.queued_followups_for_thread(thread.id)
+            if status == "deleted" or items or status == "updated":
+                break
+        return {
+            "ok": True,
+            "status": status,
+            "threadId": thread.id,
+            "sessionId": thread.id,
+            "items": items,
+            "count": len(items),
+            "officialQueueCount": len(items),
+            **(extra or {}),
+        }
+
+    def _official_queue_not_found(self, thread: ThreadRecord, item_id: str) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "failed",
+            "threadId": thread.id,
+            "sessionId": thread.id,
+            "itemId": item_id,
+            "error": "Official Codex queue item was not found.",
+        }
+
+    def _official_queue_update_failed(
+        self,
+        thread: ThreadRecord,
+        update_result: dict[str, Any],
+    ) -> dict[str, Any]:
+        return {
+            "ok": False,
+            "status": "failed",
+            "threadId": thread.id,
+            "sessionId": thread.id,
+            "error": update_result.get("error") or "Codex desktop did not accept the queue update.",
+            "queueResult": update_result,
         }
 
     def _attach_official_queue(

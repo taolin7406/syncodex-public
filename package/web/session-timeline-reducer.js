@@ -18,6 +18,12 @@ const USER_MESSAGE_MIRROR_SOURCES = new Set([
   "response_item.message",
   "event_msg.user_message",
 ]);
+const DUPLICATE_ASSISTANT_MESSAGE_WINDOW_MS = 30 * 1000;
+const ASSISTANT_MESSAGE_MIRROR_SOURCES = new Set([
+  "message.assistant",
+  "response_item.message",
+  "event_msg.agent_message",
+]);
 
 function createItemIndex() {
   return new Map();
@@ -66,6 +72,10 @@ function appendDeltaText(currentText, textDelta) {
 }
 
 function normalizeUserMessageText(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function normalizeAssistantMessageText(value) {
   return String(value || "").replace(/\s+/g, " ").trim();
 }
 
@@ -132,6 +142,70 @@ function findRecentDuplicateUserItem(state, event) {
   return null;
 }
 
+function isAssistantMirrorSourcePair(left, right) {
+  if (!ASSISTANT_MESSAGE_MIRROR_SOURCES.has(left || "")) {
+    return false;
+  }
+  if (!ASSISTANT_MESSAGE_MIRROR_SOURCES.has(right || "")) {
+    return false;
+  }
+  return left !== right;
+}
+
+function isRecentAssistantMessageDuplicate(item, event) {
+  const phase = resolveAssistantItemType(event);
+  if (item?.type !== phase) {
+    return false;
+  }
+
+  const text = normalizeAssistantMessageText(event.payload?.text);
+  if (!text || normalizeAssistantMessageText(item.text) !== text) {
+    return false;
+  }
+
+  if (!isAssistantMirrorSourcePair(item.source, event.payload?.source)) {
+    return false;
+  }
+
+  const leftTimestamp = getTimestampMs(item.timestamp);
+  const rightTimestamp = getTimestampMs(event.timestamp);
+  if (leftTimestamp !== null && rightTimestamp !== null) {
+    return Math.abs(leftTimestamp - rightTimestamp) <= DUPLICATE_ASSISTANT_MESSAGE_WINDOW_MS;
+  }
+
+  return Math.abs(Number(item.seq || 0) - Number(event.seq || 0)) <= 2;
+}
+
+function findRecentDuplicateAssistantItem(state, event) {
+  for (let index = state.timelineItems.length - 1; index >= 0; index -= 1) {
+    const item = state.timelineItems[index];
+    if (isRecentAssistantMessageDuplicate(item, event)) {
+      return item;
+    }
+  }
+  return null;
+}
+
+function linkDuplicateAssistantMessage(state, event, turnId, duplicateItem) {
+  if (!duplicateItem) {
+    return false;
+  }
+
+  const turn = ensureTurn(state, turnId, event);
+  if (!turn.messageIds.includes(duplicateItem.id)) {
+    turn.messageIds.push(duplicateItem.id);
+  }
+
+  if (resolveAssistantItemType(event) === "assistant_commentary") {
+    turn.lastCommentaryId = duplicateItem.id;
+  } else {
+    turn.finalMessageId = duplicateItem.id;
+    completeReasoningIfPresent(state, turn);
+  }
+
+  return true;
+}
+
 function reduceLegacyAssistantMessage(state, event) {
   const messageId = nextMessageFallbackId(event, resolveAssistantItemType(event));
   reduceTimeline(state, {
@@ -139,7 +213,10 @@ function reduceLegacyAssistantMessage(state, event) {
     id: `${event.id}:start`,
     kind: "assistant_message_start",
     messageId,
-    payload: { raw: event.payload?.raw || event.payload || {} },
+    payload: {
+      source: event.payload?.source || null,
+      raw: event.payload?.raw || event.payload || {},
+    },
   });
   reduceTimeline(state, {
     ...event,
@@ -148,6 +225,7 @@ function reduceLegacyAssistantMessage(state, event) {
     messageId,
     payload: {
       textDelta: event.payload?.text || "",
+      source: event.payload?.source || null,
       raw: event.payload?.raw || event.payload || {},
     },
   });
@@ -156,7 +234,10 @@ function reduceLegacyAssistantMessage(state, event) {
     id: `${event.id}:end`,
     kind: "assistant_message_end",
     messageId,
-    payload: { raw: event.payload?.raw || event.payload || {} },
+    payload: {
+      source: event.payload?.source || null,
+      raw: event.payload?.raw || event.payload || {},
+    },
   });
 }
 
@@ -304,6 +385,7 @@ function upsertAssistantMessage(state, event, turnId, partial = {}) {
     phase: event.phase || "final_answer",
     status: "streaming",
     text: "",
+    source: event.payload?.source || null,
   };
   const item = insertTimelineItem(state, {
     ...current,
@@ -316,6 +398,7 @@ function upsertAssistantMessage(state, event, turnId, partial = {}) {
     timestamp: current.timestamp || event.timestamp,
     role: "assistant",
     phase: event.phase || current.phase || "final_answer",
+    source: partial.source || current.source || event.payload?.source || null,
   });
   state.messagesById[messageId] = item;
   if (!turn.messageIds.includes(item.id)) {
@@ -610,6 +693,14 @@ export function reduceTimeline(state, event) {
       }
       break;
     case "assistant_message":
+      if (linkDuplicateAssistantMessage(
+        state,
+        event,
+        turnId,
+        findRecentDuplicateAssistantItem(state, event),
+      )) {
+        break;
+      }
       reduceLegacyAssistantMessage(state, event);
       break;
     case "reasoning_start":

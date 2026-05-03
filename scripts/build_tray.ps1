@@ -8,6 +8,8 @@ if (-not (Test-Path -LiteralPath $Entry)) {
   throw "Tray entry not found: $Entry"
 }
 
+& (Join-Path $PSScriptRoot "build_web_bundle.ps1")
+
 $hasPyInstaller = $true
 try {
   py -m PyInstaller --version *> $null
@@ -46,14 +48,25 @@ if (-not $hasQrcode) {
 
 $Exe = Join-Path $Dist "Syncodex.exe"
 $LegacyExe = Join-Path $Dist "SyncodexNext.exe"
-$BuildDistRoot = Join-Path $Root "dist_build"
+$DefaultScratchRoot = if ($env:LOCALAPPDATA) {
+  Join-Path $env:LOCALAPPDATA "Syncodex\build"
+} else {
+  Join-Path ([System.IO.Path]::GetTempPath()) "syncodex-build"
+}
+$BuildScratchRoot = if ($env:SYNCODEX_BUILD_SCRATCH) {
+  $env:SYNCODEX_BUILD_SCRATCH
+} else {
+  $DefaultScratchRoot
+}
+$BuildDistRoot = Join-Path $BuildScratchRoot "dist_build"
 $BuildStamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $BuildDist = Join-Path $BuildDistRoot ("syncodex-" + $BuildStamp)
-$BuildWorkRoot = Join-Path $Root "build_tmp"
+$BuildWorkRoot = Join-Path $BuildScratchRoot "build_tmp"
 $BuildWork = Join-Path $BuildWorkRoot ("syncodex-" + $BuildStamp)
 
 New-Item -ItemType Directory -Path $BuildDist -Force | Out-Null
 New-Item -ItemType Directory -Path $BuildWork -Force | Out-Null
+Write-Host "Using build scratch: $BuildScratchRoot"
 
 py -m PyInstaller `
   --noconfirm `

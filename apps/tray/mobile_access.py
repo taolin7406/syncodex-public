@@ -46,6 +46,12 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         self._handle_proxy()
 
+    def do_PATCH(self) -> None:
+        self._handle_proxy()
+
+    def do_DELETE(self) -> None:
+        self._handle_proxy()
+
     def do_HEAD(self) -> None:
         self._handle_proxy()
 
@@ -55,7 +61,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             return self._forbidden()
 
         if should_redirect and self.command == "GET":
-            return self._proxy_request(strip_access_token=True)
+            return self._redirect_without_token()
 
         return self._proxy_request()
 
@@ -122,7 +128,7 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
 
     def _proxy_request(self, *, strip_access_token: bool = False) -> None:
         body = None
-        if self.command in {"POST", "PUT", "PATCH"}:
+        if self.command in {"POST", "PUT", "PATCH", "DELETE"}:
             length = int(self.headers.get("Content-Length") or "0")
             body = self.rfile.read(length) if length > 0 else b""
 
